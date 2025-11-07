@@ -87,7 +87,7 @@ def get_detections():
         
         response = falcon_detect.query_alerts(
             filter=filter_string,
-            limit=100,
+            limit=100000,
             sort='created_timestamp.desc'
         )
         print(f"DEBUG: query_Alerts response code: {response['status_code']}")
@@ -232,7 +232,7 @@ def get_iocs():
         
         response = falcon_ioc.indicator_search(
             filter=filter_string,
-            limit=100
+            limit=100000
         )
         
         if response['status_code'] != 200:
@@ -470,7 +470,7 @@ def generate_report():
             falcon_detect = Alerts(auth_object=falcon_auth)
             time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(hours=time_range)).isoformat()}Z'"
             
-            response = falcon_detect.query_Alerts(filter=time_filter, limit=100)
+            response = falcon_detect.query_Alerts(filter=time_filter, limit=100000)
             detection_ids = response['body']['resources']
             
             if detection_ids:
@@ -561,7 +561,7 @@ def get_hosts():
         print("DEBUG: Created Hosts object")
         
         status = request.args.get('status', None)
-        limit = int(request.args.get('limit', 100))
+        limit = int(request.args.get('limit', 100000))
         
         filter_string = None
         if status:
@@ -815,7 +815,7 @@ def advanced_search():
     try:
         data = request.json
         filter_string = data.get('filter', '')
-        limit = int(data.get('limit', 100))
+        limit = int(data.get('limit', 100000))
         offset = int(data.get('offset', 0))
         
         falcon_detect = Alerts(auth_object=falcon_auth)
