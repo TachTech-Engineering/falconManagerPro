@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { AlertTriangle, Shield, Activity, Server, Search, RefreshCw, AlertCircle, Download, Plus, Play, Save, Eye } from 'lucide-react';
 
-const API_BASE = 'http://localhost:5003/api';
+const API_BASE = '/api';
+
 
 const FalconDashboard = () => {
   const [activeTab, setActiveTab] = useState('detections');
