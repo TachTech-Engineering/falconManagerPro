@@ -1,6 +1,6 @@
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from falconpy import Detects, Hosts, Incidents, EventStreams, OAuth2, IOC, Intel
+from falconpy import Alerts, Hosts, Incidents, EventStreams, OAuth2, IOC, Intel
 from datetime import datetime, timedelta
 import logging
 import json
@@ -66,7 +66,9 @@ def get_detections():
         return jsonify({'error': 'Not authenticated'}), 401
     
     try:
-        falcon_detect = Detects(auth_object=falcon_auth)
+        print("DEBUG: Starting get_detections")
+        falcon_detect = Alerts(auth_object=falcon_auth)
+        print("DEBUG: Created Alerts object")
         
         severity = request.args.get('severity', None)
         status = request.args.get('status', None)
@@ -81,24 +83,30 @@ def get_detections():
             filters.append(f"status:'{status}'")
         
         filter_string = '+'.join(filters)
+        print(f"DEBUG: Filter string: {filter_string}")
         
-        response = falcon_detect.query_detects(
+        response = falcon_detect.query_alerts(
             filter=filter_string,
             limit=100,
             sort='created_timestamp.desc'
         )
+        print(f"DEBUG: query_Alerts response code: {response['status_code']}")
         
         if response['status_code'] != 200:
+            print(f"DEBUG: Query failed with body: {response['body']}")
             return jsonify({'error': 'Failed to query detections'}), 500
         
         detection_ids = response['body']['resources']
+        print(f"DEBUG: Found {len(detection_ids)} detection IDs")
         
         if not detection_ids:
             return jsonify({'detections': []})
         
-        details_response = falcon_detect.get_detect_summaries(ids=detection_ids)
+        details_response = falcon_detect.get_alerts(ids=detection_ids)
+        print(f"DEBUG: get_detect_summaries response code: {details_response['status_code']}")
         
         if details_response['status_code'] != 200:
+            print(f"DEBUG: Get summaries failed with body: {details_response['body']}")
             return jsonify({'error': 'Failed to get detection details'}), 500
         
         detections = []
@@ -116,9 +124,13 @@ def get_detections():
                 'assigned_to': det.get('assigned_to_name', 'Unassigned')
             })
         
+        print(f"DEBUG: Successfully processed {len(detections)} detections")
         return jsonify({'detections': detections})
         
     except Exception as e:
+        print(f"ERROR DETAILS: {e}")
+        import traceback
+        traceback.print_exc()
         logger.error(f"Error fetching detections: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
@@ -138,9 +150,9 @@ def update_detection_status(detection_id):
         if not new_status:
             return jsonify({'error': 'Status is required'}), 400
         
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
-        response = falcon_detect.update_detects_by_ids(
+        response = falcon_detect.update_Alerts_by_ids(
             ids=[detection_id],
             status=new_status,
             assigned_to_uuid=assigned_to,
@@ -176,7 +188,7 @@ def bulk_update_detections():
         if not detection_ids or not new_status:
             return jsonify({'error': 'detection_ids and status required'}), 400
         
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
         response = falcon_detect.update_detections(
             ids=detection_ids,
@@ -364,7 +376,7 @@ def execute_playbook(playbook_id):
                 })
             
             elif action['type'] == 'close_detection':
-                falcon_detect = Detects(auth_object=falcon_auth)
+                falcon_detect = Alerts(auth_object=falcon_auth)
                 response = falcon_detect.update_detections(
                     ids=[target_id],
                     status='false_positive',
@@ -455,10 +467,10 @@ def generate_report():
         
         # Fetch data based on report type
         if report_type == 'detections':
-            falcon_detect = Detects(auth_object=falcon_auth)
+            falcon_detect = Alerts(auth_object=falcon_auth)
             time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(hours=time_range)).isoformat()}Z'"
             
-            response = falcon_detect.query_detects(filter=time_filter, limit=100)
+            response = falcon_detect.query_Alerts(filter=time_filter, limit=100)
             detection_ids = response['body']['resources']
             
             if detection_ids:
@@ -515,7 +527,7 @@ def get_recent_events():
         return jsonify({'error': 'Not authenticated'}), 401
     
     try:
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
         # Get detections from last 5 minutes
         time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(minutes=5)).isoformat()}Z'"
@@ -544,7 +556,9 @@ def get_hosts():
         return jsonify({'error': 'Not authenticated'}), 401
     
     try:
+        print("DEBUG: Starting get_hosts")
         falcon_hosts = Hosts(auth_object=falcon_auth)
+        print("DEBUG: Created Hosts object")
         
         status = request.args.get('status', None)
         limit = int(request.args.get('limit', 100))
@@ -553,23 +567,30 @@ def get_hosts():
         if status:
             filter_string = f"status:'{status}'"
         
+        print(f"DEBUG: Querying hosts with filter: {filter_string}, limit: {limit}")
         response = falcon_hosts.query_devices(
             filter=filter_string,
             limit=limit,
             sort='last_seen.desc'
         )
         
+        print(f"DEBUG: query_devices response code: {response['status_code']}")
+        
         if response['status_code'] != 200:
+            print(f"DEBUG: Query hosts failed with body: {response['body']}")
             return jsonify({'error': 'Failed to query hosts'}), 500
         
         host_ids = response['body']['resources']
+        print(f"DEBUG: Found {len(host_ids)} host IDs")
         
         if not host_ids:
             return jsonify({'hosts': []})
         
         details_response = falcon_hosts.get_device_details(ids=host_ids)
+        print(f"DEBUG: get_device_details response code: {details_response['status_code']}")
         
         if details_response['status_code'] != 200:
+            print(f"DEBUG: Get host details failed with body: {details_response['body']}")
             return jsonify({'error': 'Failed to get host details'}), 500
         
         hosts = []
@@ -585,9 +606,13 @@ def get_hosts():
                 'platform': host.get('platform_name')
             })
         
+        print(f"DEBUG: Successfully processed {len(hosts)} hosts")
         return jsonify({'hosts': hosts})
         
     except Exception as e:
+        print(f"ERROR DETAILS: {e}")
+        import traceback
+        traceback.print_exc()
         logger.error(f"Error fetching hosts: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
@@ -648,7 +673,7 @@ def close_by_hash():
         if not hash_value:
             return jsonify({'error': 'Hash value required'}), 400
         
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
         # Search for hash in both XDR and ODS detections
         filter_xdr = f'entities.sha256:"{hash_value}"'
@@ -658,12 +683,12 @@ def close_by_hash():
         ids_ods = []
         
         # Query XDR detections
-        response_xdr = falcon_detect.query_detects(filter=filter_xdr, limit=10000)
+        response_xdr = falcon_detect.query_Alerts(filter=filter_xdr, limit=10000)
         if response_xdr['status_code'] == 200:
             ids_xdr = response_xdr['body']['resources']
         
         # Query ODS detections
-        response_ods = falcon_detect.query_detects(filter=filter_ods, limit=10000)
+        response_ods = falcon_detect.query_Alerts(filter=filter_ods, limit=10000)
         if response_ods['status_code'] == 200:
             ids_ods = response_ods['body']['resources']
         
@@ -697,7 +722,7 @@ def close_by_hash():
         
         for i in range(0, len(all_ids), batch_size):
             batch = all_ids[i:i + batch_size]
-            response = falcon_detect.update_detects_by_ids(
+            response = falcon_detect.update_Alerts_by_ids(
                 ids=batch,
                 status=status,
                 comment=comment
@@ -732,10 +757,10 @@ def hash_summary():
         filter_string = request.args.get('filter', 'status:"new"')
         limit = int(request.args.get('limit', 10000))
         
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
         # Query detections
-        response = falcon_detect.query_detects(filter=filter_string, limit=limit)
+        response = falcon_detect.query_Alerts(filter=filter_string, limit=limit)
         
         if response['status_code'] != 200:
             return jsonify({'error': 'Failed to query detections'}), 500
@@ -793,10 +818,10 @@ def advanced_search():
         limit = int(data.get('limit', 100))
         offset = int(data.get('offset', 0))
         
-        falcon_detect = Detects(auth_object=falcon_auth)
+        falcon_detect = Alerts(auth_object=falcon_auth)
         
         # Query detections
-        response = falcon_detect.query_detects(
+        response = falcon_detect.query_Alerts(
             filter=filter_string,
             limit=limit,
             offset=offset
