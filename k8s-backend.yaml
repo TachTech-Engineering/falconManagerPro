@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: falcon-api
+  labels:
+    app: falcon-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: falcon-api
+  template:
+    metadata:
+      labels:
+        app: falcon-api
+    spec:
+      containers:
+        - name: falcon-api
+          image: us-central1-docker.pkg.dev/falconmanagerpro/falcon-manager/falcon-api:v1
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5003
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 5003
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 5003
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: falcon-api
+  labels:
+    app: falcon-api
+spec:
+  selector:
+    app: falcon-api
+  ports:
+    - name: http
+      port: 5003
+      targetPort: 5003
+  type: ClusterIP

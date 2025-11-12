@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: falcon-ui
+  labels:
+    app: falcon-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: falcon-ui
+  template:
+    metadata:
+      labels:
+        app: falcon-ui
+    spec:
+      containers:
+        - name: falcon-ui
+          image: us-central1-docker.pkg.dev/falconmanagerpro/app-repo/falcon-ui:v1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: falcon-ui
+  labels:
+    app: falcon-ui
+spec:
+  selector:
+    app: falcon-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+  type: LoadBalancer

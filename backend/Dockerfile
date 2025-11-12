@@ -28,7 +28,7 @@ EXPOSE 5003
 # Gunicorn tuned for API IO + k8s
 # - worker tmpfiles disabled, forwards client IPs through proxy, tighter timeouts
 CMD ["gunicorn", \
-     "--workers=3", \
+     "--workers=1", \
      "--threads=8", \
      "--worker-class=gthread", \
      "--bind=0.0.0.0:5003", \

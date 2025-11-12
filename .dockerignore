@@ -1,0 +1,4 @@
+node_modules
+build
+# allow nginx.conf to be copied into the image
+!nginx.conf
