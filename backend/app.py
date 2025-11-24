@@ -2926,6 +2926,7 @@ def generate_report():
                     det.get('id', ''),
                     det.get('severity', ''),
                     det.get('status', ''),
+                    
                     det.get('host', ''),
                     det.get('tactic', ''),
                     det.get('timestamp', ''),
