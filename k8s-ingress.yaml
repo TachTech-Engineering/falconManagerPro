@@ -1,0 +1,63 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: falcon-ingress
+  annotations:
+    # Use the reserved static IP
+    kubernetes.io/ingress.global-static-ip-name: "falcon-ui-ip"
+    # Enable HTTPS redirect
+    kubernetes.io/ingress.allow-http: "true"
+    # GCP-managed certificate (we'll add Cloudflare origin cert as Secret)
+    networking.gke.io/managed-certificates: "falcon-managed-cert"
+    # Use GCE ingress class
+    kubernetes.io/ingress.class: "gce"
+spec:
+  tls:
+  - hosts:
+    - falconmanagerpro.com
+    - www.falconmanagerpro.com
+    secretName: cloudflare-origin-cert
+  rules:
+  - host: falconmanagerpro.com
+    http:
+      paths:
+      - path: /api/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: falcon-api
+            port:
+              number: 5003
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: falcon-ui
+            port:
+              number: 80
+  - host: www.falconmanagerpro.com
+    http:
+      paths:
+      - path: /api/*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: falcon-api
+            port:
+              number: 5003
+      - path: /*
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: falcon-ui
+            port:
+              number: 80
+---
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: falcon-managed-cert
+spec:
+  domains:
+    - falconmanagerpro.com
+    - www.falconmanagerpro.com

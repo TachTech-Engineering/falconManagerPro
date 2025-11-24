@@ -51,3 +51,9 @@ htmlcov/
 *.json
 *.xlsx
 reports/
+
+# TLS Certificates and Secrets - DO NOT COMMIT
+*.pem
+fmp-origin.pem
+fmpp.pem
+cloudflare-origin-secret.yaml

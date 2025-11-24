@@ -1,196 +1,372 @@
-# FalconPy Detection Management - Documentation Index
+# Falcon Manager Pro - CrowdStrike Detection Management Platform
 
-**Project:** CrowdStrike Falcon Bulk Detection Management
-**Created:** 2025-10-31
-**Status:** ✅ Production Ready
-
----
-
-## Quick Start
-
-**New to the project? Start here:**
-
-1. **Setup Guide** → [`SETUP_GUIDE.md`](SETUP_GUIDE.md)
-2. **Quick Reference** → [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md)
-3. **Try it:** `venv/bin/python scripts/query_detections.py --test-connection`
+**Project:** CrowdStrike Falcon Detection Management & Response Platform
+**Status:** ✅ Production - Deployed on GKE
+**Domain:** https://falconmanagerpro.com
+**Version:** 1.1
 
 ---
 
-## Documentation Files
+## Overview
 
-### 📚 Core Documentation
+**Falcon Manager Pro** is a comprehensive web-based platform for managing CrowdStrike Falcon detections, incidents, hosts, and IOCs. It combines Python CLI tools with a full-stack web application (React + Flask) deployed on Google Kubernetes Engine with Cloudflare CDN and Full (Strict) TLS encryption.
 
-#### [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md)
-**Quick command reference for daily use**
-- Common commands with examples
-- FQL filter examples
-- Multi-customer workflow
-- Troubleshooting quick fixes
+### Platform Components
 
-**Use this for:** Daily operations, looking up command syntax
+1. **Web Application** - Full-featured detection management dashboard
+   - React frontend with real-time updates
+   - Flask backend API with CrowdStrike FalconPy integration
+   - Containerized and deployed on GKE
 
----
-
-#### [`SETUP_GUIDE.md`](SETUP_GUIDE.md)
-**Complete setup and installation instructions**
-- Initial environment setup
-- API credential configuration
-- Multi-customer setup
-- Architecture explanation
-- Security best practices
-
-**Use this for:** First-time setup, new deployments, customer onboarding
+2. **CLI Tools** - Python scripts for bulk operations
+   - Hash-based detection management
+   - Bulk closure operations
+   - Report generation
+   - Multi-customer support
 
 ---
 
-#### [`SCRIPTS_REFERENCE.md`](SCRIPTS_REFERENCE.md)
-**Detailed reference for all scripts**
-- Complete parameter documentation
-- Input/output examples
-- Workflow patterns
-- Exit codes
-- Performance metrics
+## 🌟 Key Features
 
-**Use this for:** Understanding script details, advanced usage
+### Detection Management
+- **Real-time Monitoring** - Auto-refresh dashboard with live activity indicator
+- **Advanced Search** - FQL (Falcon Query Language) filtering
+- **Bulk Operations** - Select and update multiple detections simultaneously
+- **Severity Filtering** - Quick filter by Critical, High, Medium, Low
+- **Assignment Management** - Assign detections to team members
+- **Comment Workflows** - Required comments before status changes
 
----
+### Hash-Based Operations
+- **Close by Hash** - Bulk close all detections matching a SHA256 hash
+  - Supports both XDR and ODS detection types
+  - Dry-run mode to preview changes
+  - Batch processing for thousands of detections
+- **Hash Analysis** - Group and analyze detections by file hash
+  - Identify repetitive false positives
+  - One-click bulk operations from analysis view
 
-#### [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
-**Solutions to common problems**
-- Connection issues
-- Query/search problems
-- Closure/update errors
-- Script execution issues
-- Diagnostic commands
+### IOC Management
+- **Custom Indicators** - Create IPv4, Domain, MD5, and SHA256 IOCs
+- **IOC Exclusions** - Whitelist known-good files
+- **Severity Levels** - Assign criticality to each indicator
+- **Policy Control** - Detect, prevent, or allow actions
 
-**Use this for:** When something isn't working
+### Automated Response
+- **Response Playbooks** - Automated workflows for common scenarios
+- **Trigger Conditions** - Execute on critical detections, ransomware, etc.
+- **Multi-Action Chains** - Contain host, create incident, close detection
+- **Manual Execution** - Run playbooks on-demand
 
----
+### Host Management
+- **Endpoint Inventory** - View all managed hosts with status
+- **Network Containment** - Isolate compromised systems
+- **Agent Status** - Monitor online/offline hosts
 
-#### [`SESSION_NOTES_251031.md`](SESSION_NOTES_251031.md)
-**Historical record of project development**
-- What we built
-- Key discoveries
-- Lessons learned
-- Technical details
-- Testing & validation
-
-**Use this for:** Understanding project history, reference for decisions made
-
----
-
-### 📁 Project Files
-
-#### [`README.md`](README.md)
-**Project overview and basic usage**
-- Project structure
-- Setup instructions
-- Usage examples
-- Safety features
+### Reporting & Export
+- **PDF Reports** - Generate professional detection reports
+- **Saved Views** - Store custom filter configurations
+- **Dashboard Statistics** - At-a-glance metrics
+- **Hash Summary Reports** - Markdown export for analysis
 
 ---
 
-#### [`.env.example`](.env.example)
-**Template for API credentials**
-- Copy to `.env` and fill in credentials
-- Never commit actual `.env` file!
+## 🏗️ Architecture
+
+### Infrastructure (Production)
+
+```
+User
+  ↓
+Cloudflare CDN (TLS Termination)
+  ↓ [Full Strict TLS]
+GCP Load Balancer (136.110.230.236)
+  ↓
+Kubernetes Ingress
+  ├─→ /api/* → falcon-api (Flask Backend - Port 5003)
+  └─→ /*     → falcon-ui (React Frontend - Port 80)
+                    ↓
+              CrowdStrike Falcon API
+```
+
+### Technology Stack
+
+**Frontend:**
+- React 18+ (Single Page Application)
+- Lucide Icons
+- Modern responsive UI
+- Session-based authentication
+
+**Backend:**
+- Python 3.8+ with Flask 3.0
+- CrowdStrike FalconPy SDK 1.4+
+- Flask-CORS for API access
+- ReportLab for PDF generation
+- Gunicorn WSGI server
+
+**Infrastructure:**
+- Google Kubernetes Engine (GKE Autopilot)
+- Cloudflare CDN with Full (Strict) TLS
+- Google Artifact Registry
+- Docker containerization
+- Nginx reverse proxy
+
+**CLI Tools:**
+- Python 3.8+ with FalconPy
+- Tabulate for formatted output
+- Colorama for terminal colors
+- TQDM for progress bars
 
 ---
 
-## Scripts Overview
+## 📁 Project Structure
 
-### Analysis & Reporting
-| Script | Purpose | Output |
-|--------|---------|--------|
-| `hash_summary.py` | Analyze SHA256 hashes | Terminal + Markdown file |
-| `query_detections.py` | Search detections | Terminal |
-
-### Operations (Modifies Data!)
-| Script | Purpose | Safety Features |
-|--------|---------|-----------------|
-| `close_by_hash.py` | Close by SHA256 | Dry-run, confirmation prompt |
-| `bulk_close_detections.py` | Bulk close by filter | Dry-run, confirmation prompt |
-| `create_ioc_exclusion.py` | Create hash exclusions | Confirmation prompt |
-
----
-
-## Quick Command Reference
-
-### Most Common Commands
-
-```bash
-# 1. Generate hash report
-venv/bin/python scripts/hash_summary.py -o report_$(date +%y%m%d).md
-
-# 2. Search by hash
-venv/bin/python scripts/query_detections.py \
-  --hash "YOUR_HASH" \
-  --details
-
-# 3. Close by hash (dry-run first!)
-venv/bin/python scripts/close_by_hash.py \
-  --hash "YOUR_HASH" \
-  --dry-run
-
-# 4. Close by hash (for real)
-venv/bin/python scripts/close_by_hash.py \
-  --hash "YOUR_HASH" \
-  --comment "Benign - SOC approved"
-
-# 5. Bulk close (ALWAYS dry-run first!)
-venv/bin/python scripts/bulk_close_detections.py \
-  --filter 'status:"new"' \
-  --dry-run
+```
+falconpy/
+├── README.md                          # This file - Project overview
+├── CLOUDFLARE_TLS_SETUP.md           # TLS/HTTPS setup guide
+├── SETUP_GUIDE.md                    # CLI tools setup
+├── QUICK_REFERENCE.md                # CLI command reference
+├── SCRIPTS_REFERENCE.md              # Script documentation
+├── TROUBLESHOOTING.md                # Problem solving guide
+├── CHANGES_2025-11-24.md             # Recent changes
+├── falcon_pro_README.md              # Web app features
+│
+├── Dockerfile                        # Frontend container
+├── nginx.conf                        # Nginx reverse proxy config
+├── k8s-backend.yaml                  # Backend K8s deployment
+├── k8s-frontend.yaml                 # Frontend K8s deployment
+├── k8s-ingress.yaml                  # Ingress with TLS
+├── cloudflare-origin-secret.yaml     # TLS certificate secret
+├── deploy-tls.sh                     # Deployment script
+│
+├── backend/                          # Flask API Backend
+│   ├── app.py                       # Main Flask application (1,100 lines)
+│   ├── Dockerfile                   # Backend container
+│   └── requirements.txt             # Python dependencies
+│
+├── src/                              # React Frontend
+│   ├── App.js                       # Main React component (1,431 lines)
+│   ├── index.js                     # React entry point
+│   └── ...
+│
+├── public/                           # Static assets
+│   └── index.html                   # HTML template
+│
+├── lib/                              # CLI Tools Library
+│   └── falcon_utils.py              # Core utility functions
+│
+├── scripts/                          # CLI Scripts
+│   ├── hash_summary.py              # Hash analysis & reporting
+│   ├── query_detections.py          # Search detections
+│   ├── close_by_hash.py             # Bulk close by hash
+│   ├── bulk_close_detections.py     # Bulk close operations
+│   └── create_ioc_exclusion.py      # IOC management
+│
+├── venv/                             # Python virtual environment
+├── node_modules/                     # Node.js dependencies
+│
+├── .env                              # API credentials (secret!)
+├── .env.example                      # Credentials template
+└── .gitignore                        # Protects secrets & certificates
 ```
 
 ---
 
-## Documentation by Use Case
+## 🚀 Quick Start
 
-### 🆕 I'm setting up for the first time
-1. Read: [`SETUP_GUIDE.md`](SETUP_GUIDE.md)
-2. Follow: Initial Setup section
-3. Test: Connection test command
-4. Bookmark: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md)
+### Option 1: Access Production Web App
 
-### 📊 I want to generate a report
-1. Command: `venv/bin/python scripts/hash_summary.py -o report.md`
-2. Reference: [`SCRIPTS_REFERENCE.md`](SCRIPTS_REFERENCE.md) → hash_summary.py
-3. Examples: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md) → Daily Commands
+Visit: **https://falconmanagerpro.com**
 
-### 🔍 I need to find a specific detection
-1. Command: `venv/bin/python scripts/query_detections.py --hash "YOUR_HASH"`
-2. Reference: [`SCRIPTS_REFERENCE.md`](SCRIPTS_REFERENCE.md) → query_detections.py
-3. Filters: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md) → Common FQL Filters
+1. Enter your CrowdStrike API credentials
+2. Start managing detections through the web interface
 
-### ✅ I want to close detections
-1. **IMPORTANT:** Always dry-run first!
-2. Read: [`SCRIPTS_REFERENCE.md`](SCRIPTS_REFERENCE.md) → close_by_hash.py
-3. Follow: Workflow patterns in [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md)
-4. Command: `venv/bin/python scripts/close_by_hash.py --hash "HASH" --dry-run`
+### Option 2: Use CLI Tools Locally
 
-### 🔧 Something isn't working
-1. Read: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
-2. Run: Diagnostic commands
-3. Check: Environment variables and credentials
+#### Prerequisites
+- Python 3.8+
+- CrowdStrike Falcon API credentials
 
-### 👥 I'm setting up for multiple customers
-1. Read: [`SETUP_GUIDE.md`](SETUP_GUIDE.md) → Multi-Customer Setup
-2. Follow: [`QUICK_REFERENCE.md`](QUICK_REFERENCE.md) → Multi-Customer Workflow
-3. Create: Separate `.env` files per customer
+#### Setup
 
-### 📚 I want to understand the code
-1. Read: [`SESSION_NOTES_251031.md`](SESSION_NOTES_251031.md) → Technical Details
-2. Read: [`SETUP_GUIDE.md`](SETUP_GUIDE.md) → Understanding the Architecture
-3. Review: `lib/falcon_utils.py` source code
+```bash
+# Clone/navigate to project
+cd /home/kthompson/Development/Projects/falconpy
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r backend/requirements.txt
+
+# Configure API credentials
+cp .env.example .env
+# Edit .env with your credentials
+
+# Test connection
+python scripts/query_detections.py --test-connection
+```
+
+#### Common CLI Commands
+
+```bash
+# Generate hash report
+python scripts/hash_summary.py -o report_$(date +%y%m%d).md
+
+# Search by hash
+python scripts/query_detections.py --hash "YOUR_HASH" --details
+
+# Close by hash (dry-run first!)
+python scripts/close_by_hash.py --hash "YOUR_HASH" --dry-run
+
+# Close by hash (for real)
+python scripts/close_by_hash.py --hash "YOUR_HASH" --comment "Benign - SOC approved"
+
+# Bulk close with filter
+python scripts/bulk_close_detections.py --filter 'status:"new"' --dry-run
+```
 
 ---
 
-## Key Concepts
+## 📚 Documentation
+
+### 🔧 Setup & Configuration
+- **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Complete CLI tools setup
+- **[CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)** - Infrastructure & TLS setup
+- **[.env.example](.env.example)** - API credentials template
+
+### 📖 Usage Guides
+- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - CLI command reference
+- **[SCRIPTS_REFERENCE.md](SCRIPTS_REFERENCE.md)** - Detailed script documentation
+- **[falcon_pro_README.md](falcon_pro_README.md)** - Web app features & usage
+
+### 🔍 Troubleshooting
+- **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** - Common issues & solutions
+
+### 📝 Reference
+- **[CHANGES_2025-11-24.md](CHANGES_2025-11-24.md)** - Recent updates
+
+---
+
+## 🎯 Use Cases
+
+### 🆕 First-Time Setup
+1. Read: [SETUP_GUIDE.md](SETUP_GUIDE.md)
+2. Configure: `.env` file with API credentials
+3. Test: `python scripts/query_detections.py --test-connection`
+4. Bookmark: [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
+
+### 📊 Generate Reports
+```bash
+python scripts/hash_summary.py -o report.md
+```
+Reference: [SCRIPTS_REFERENCE.md](SCRIPTS_REFERENCE.md) → hash_summary.py
+
+### 🔍 Find Specific Detections
+```bash
+python scripts/query_detections.py --hash "YOUR_HASH"
+```
+Reference: [QUICK_REFERENCE.md](QUICK_REFERENCE.md) → Common FQL Filters
+
+### ✅ Close Detections
+**IMPORTANT:** Always dry-run first!
+```bash
+python scripts/close_by_hash.py --hash "HASH" --dry-run
+python scripts/close_by_hash.py --hash "HASH" --comment "Reason"
+```
+Reference: [SCRIPTS_REFERENCE.md](SCRIPTS_REFERENCE.md) → Workflow patterns
+
+### 🔧 Troubleshoot Issues
+1. Read: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+2. Run diagnostic commands
+3. Check environment variables and credentials
+
+### 👥 Multi-Customer Setup
+1. Read: [SETUP_GUIDE.md](SETUP_GUIDE.md) → Multi-Customer Setup
+2. Create separate `.env` files per customer
+3. Switch: `export ENV_FILE=customer.env`
+
+### 🔒 Deploy Infrastructure
+1. Read: [CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)
+2. Deploy: K8s configurations to GKE
+3. Configure: DNS and SSL/TLS in Cloudflare
+
+---
+
+## 🔐 Security
+
+### Authentication
+- **API Credentials**: Stored securely in `.env` (never committed)
+- **Session-based**: Web app uses session storage
+- **OAuth2**: CrowdStrike API authentication
+
+### Encryption
+- **TLS 1.2+**: End-to-end encryption
+- **Cloudflare Full (Strict)**: Origin certificate validation
+- **Certificate Validity**: 15 years (expires 2040-11-20)
+
+### API Scopes Required
+- **Detections**: Read, Write
+- **Hosts**: Read, Write
+- **IOC**: Read, Write
+- **Custom IOC**: Read, Write
+- **Incidents**: Read, Write (optional)
+- **Event Streams**: Read (optional)
+
+### Protected Files (.gitignore)
+```
+.env
+*.pem
+cloudflare-origin-secret.yaml
+```
+
+---
+
+## 🌐 Production Deployment
+
+### GCP Infrastructure
+- **Project**: falconmanagerpro
+- **Region**: us-central1
+- **Cluster**: falcon-autopilot (GKE Autopilot)
+- **Static IP**: 136.110.230.236 (falcon-ui-ip)
+
+### Container Registries
+- **falcon-manager**: Backend API images (52+ versions)
+- **app-repo**: Frontend UI images (10+ versions)
+
+### Domain & CDN
+- **Domain**: falconmanagerpro.com
+- **DNS**: Cloudflare (nameservers transferred from GoDaddy)
+- **SSL/TLS**: Full (strict) mode
+- **CDN**: Cloudflare with DDoS protection
+
+### Deployment Process
+
+```bash
+# Build & push backend
+cd backend
+docker build -t us-central1-docker.pkg.dev/falconmanagerpro/falcon-manager/falcon-api:v1 .
+docker push us-central1-docker.pkg.dev/falconmanagerpro/falcon-manager/falcon-api:v1
+
+# Build & push frontend
+docker build -t us-central1-docker.pkg.dev/falconmanagerpro/app-repo/falcon-ui:v1 .
+docker push us-central1-docker.pkg.dev/falconmanagerpro/app-repo/falcon-ui:v1
+
+# Apply K8s configurations
+kubectl apply -f k8s-backend.yaml
+kubectl apply -f k8s-frontend.yaml
+kubectl apply -f k8s-ingress.yaml
+kubectl apply -f cloudflare-origin-secret.yaml
+```
+
+See [CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md) for complete deployment guide.
+
+---
+
+## 🔑 Key Concepts
 
 ### Detection Types
-The system handles multiple detection types with different characteristics:
-
 | Type | Product | Hash Field | Description |
 |------|---------|------------|-------------|
 | XDR | `xdr` | `entities.sha256` | Behavioral detections |
@@ -205,7 +381,6 @@ The system handles multiple detection types with different characteristics:
 - **Note:** GUI still says "Detections" but API is "Alerts"
 
 ### Status Values
-Valid status values for closing detections:
 - `new` - New/unreviewed
 - `in_progress` - Under investigation
 - `closed` - Resolved (use this for benign)
@@ -214,9 +389,9 @@ Valid status values for closing detections:
 
 ---
 
-## Safety Features
+## 🛡️ Safety Features
 
-### All Bulk Operations Include:
+### CLI Tools Include:
 - ✅ **Dry-run mode** - Preview before making changes
 - ✅ **Confirmation prompts** - Prevents accidental execution
 - ✅ **Batch processing** - Handles large volumes safely
@@ -230,90 +405,34 @@ Valid status values for closing detections:
 3. **Include meaningful comments**
 4. **Review hash summaries before closing**
 5. **Test with one hash before bulk operations**
+6. **Keep API credentials secure**
 
 ---
 
-## Project Structure
+## 📊 Version History
 
-```
-falconpy/
-├── README.md                    # Project overview
-├── QUICK_REFERENCE.md          # Daily commands (⭐ most used)
-├── SETUP_GUIDE.md              # Complete setup instructions
-├── SCRIPTS_REFERENCE.md        # Script documentation
-├── TROUBLESHOOTING.md          # Problem solving
-├── SESSION_NOTES_251031.md     # Development history
-├── DOCUMENTATION_INDEX.md      # This file
-│
-├── .env                        # API credentials (secret!)
-├── .env.example                # Template
-├── .gitignore                  # Protects secrets
-├── requirements.txt            # Python dependencies
-│
-├── lib/
-│   └── falcon_utils.py         # Core library
-│
-├── scripts/
-│   ├── hash_summary.py         # Hash analysis
-│   ├── query_detections.py     # Search detections
-│   ├── close_by_hash.py        # Close by hash
-│   ├── bulk_close_detections.py # Bulk operations
-│   └── create_ioc_exclusion.py # IOC management
-│
-├── venv/                       # Virtual environment
-│
-└── reports/                    # Generated reports (your files)
-    ├── cintas_251031.md
-    ├── daily_YYMMDD.md
-    └── ...
-```
+### v1.1 - 2025-11-24 (Infrastructure & Security Update)
+**New Features:**
+- ✅ Kubernetes deployment configuration (GKE)
+- ✅ Cloudflare Full (Strict) TLS setup
+- ✅ Kubernetes Ingress with origin certificates
+- ✅ React frontend with Flask backend architecture
+- ✅ Nginx reverse proxy configuration
+- ✅ Automated deployment scripts
+- ✅ Comprehensive TLS setup documentation
 
----
+**Infrastructure:**
+- ✅ GKE cluster: falcon-autopilot (us-central1)
+- ✅ Static IP: 136.110.230.236 (falcon-ui-ip)
+- ✅ Domain: falconmanagerpro.com
+- ✅ Cloudflare CDN with Full (Strict) TLS
+- ✅ Docker containerization (52+ backend, 10+ frontend versions)
 
-## Getting Help
-
-### Documentation Not Enough?
-
-1. **Check diagnostics:**
-   ```bash
-   venv/bin/python scripts/query_detections.py --test-connection
-   ```
-
-2. **Review troubleshooting:**
-   ```bash
-   cat TROUBLESHOOTING.md | grep -A 10 "your error message"
-   ```
-
-3. **External resources:**
-   - FalconPy Docs: https://falconpy.io/
-   - CrowdStrike API: https://falcon.crowdstrike.com/documentation/
-   - CrowdStrike Support: https://supportportal.crowdstrike.com/
-
----
-
-## Maintenance Schedule
-
-### Daily
-- Generate hash summary report
-- Review and close false positives
-
-### Weekly
-- Check for FalconPy updates: `venv/bin/pip list --outdated`
-- Review API usage in CrowdStrike console
-
-### Monthly
-- Review closed detections accuracy
-- Archive old reports
-- Update documentation if workflow changes
-
-### Quarterly
-- Rotate API credentials
-- Review and update API scopes
-- Test disaster recovery (redeployment)
-
----
-
-## Version History
+**Security:**
+- ✅ End-to-end TLS encryption
+- ✅ Cloudflare origin certificates (15-year validity)
+- ✅ Certificate management via K8s secrets
+- ✅ Updated .gitignore for certificate protection
 
 ### v1.0 - 2025-10-31 (Initial Release)
 **Features:**
@@ -326,75 +445,108 @@ falconpy/
 - ✅ Multi-customer support
 - ✅ Comprehensive documentation
 
+**Web Application:**
+- ✅ React frontend (1,431 lines)
+- ✅ Flask backend (1,100 lines)
+- ✅ Real-time detection monitoring
+- ✅ Advanced FQL search
+- ✅ Automated response playbooks
+- ✅ PDF report generation
+- ✅ Host management & containment
+
 **Tested:**
 - ✅ Connection to CrowdStrike API
 - ✅ Query 10,000+ detections
-- ✅ Close detections (4 successfully closed)
-- ✅ Generate reports
-- ✅ Export to markdown
-
-**Known Limitations:**
-- Query limit: 10,000 detections (API limitation)
-- No pagination implementation yet
-- ODS detections remain `show_in_ui: True` when closed
+- ✅ Close detections successfully
+- ✅ Generate and export reports
+- ✅ Production deployment on GKE
 
 ---
 
-## Success Metrics
+## 📈 Statistics
 
-### Project Goals - All Met! ✅
+### Codebase
+- **Backend**: 1,100 lines (Python/Flask)
+- **Frontend**: 1,431 lines (React/JavaScript)
+- **CLI Scripts**: 5 Python scripts
+- **Documentation**: 8 comprehensive guides
+- **Container Images**: 62+ versions deployed
+- **Registry Size**: 2.2 GB across 2 repositories
 
-1. ✅ **Connect to CrowdStrike Falcon API**
-   - Successfully authenticated
-   - Migrated to current Alerts API
-
-2. ✅ **Query endpoint detections**
-   - Query by filter
-   - Query by hash (both XDR and ODS)
-   - Handle 10,000+ detections
-
-3. ✅ **Identify detections by SHA256 hash**
-   - Created hash_summary.py
-   - Generates markdown reports
-   - Counts and sorts by frequency
-
-4. ✅ **Bulk mark detections as resolved**
-   - close_by_hash.py
-   - bulk_close_detections.py
-   - Safety features (dry-run, confirmations)
-
-5. ✅ **Support multiple customers**
-   - Separate .env files
-   - Easy switching
-   - Multi-customer workflow documented
-
-6. ✅ **Generate reports**
-   - Terminal + markdown output
-   - Timestamped
-   - Ready for sharing
+### Infrastructure
+- **Cluster Nodes**: 2 (GKE Autopilot)
+- **Services**: 2 (falcon-api, falcon-ui)
+- **Ingress**: 1 with TLS termination
+- **Static IPs**: 1 reserved
+- **Domains**: 1 (falconmanagerpro.com)
 
 ---
 
-## What's Next?
+## 🔧 Maintenance
 
-### Potential Enhancements (Future)
-- [ ] Pagination for >10k detections
-- [ ] CSV/JSON export formats
-- [ ] Scheduled reports (cron wrapper)
-- [ ] Email notifications
-- [ ] Progress bars (tqdm already in requirements)
-- [ ] `--env-file` parameter for easier customer switching
-- [ ] Web dashboard (optional)
+### Daily
+- Monitor detection dashboard
+- Review and close false positives
+- Check system health at `/api/health`
 
-### Not Planned (Out of Scope)
-- ❌ GUI application
-- ❌ Real-time monitoring
-- ❌ Webhook integrations
-- ❌ Custom detection rules
+### Weekly
+- Check for FalconPy updates: `pip list --outdated`
+- Review API usage in CrowdStrike console
+- Monitor container image sizes
+
+### Monthly
+- Review closed detections accuracy
+- Archive old reports
+- Update documentation if workflow changes
+- Check GKE cluster health
+
+### Quarterly
+- Rotate API credentials
+- Review and update API scopes
+- Test disaster recovery (redeployment)
+- Audit security configurations
+
+### Certificate Renewal
+- **Next renewal**: November 2040
+- **Reminder set**: November 2040
+- **Process**: [CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md) → Certificate Renewal
 
 ---
 
-## Support & Contact
+## 🆘 Support & Resources
+
+### Documentation
+- All guides available in project root
+- Inline code comments
+- API examples in scripts
+
+### External Resources
+- **FalconPy Docs**: https://falconpy.io/
+- **CrowdStrike API**: https://falcon.crowdstrike.com/documentation/
+- **CrowdStrike Support**: https://supportportal.crowdstrike.com/
+- **GKE Documentation**: https://cloud.google.com/kubernetes-engine/docs
+- **Cloudflare SSL**: https://developers.cloudflare.com/ssl/
+
+### Diagnostic Commands
+
+```bash
+# Test API connection
+python scripts/query_detections.py --test-connection
+
+# Check backend health
+curl https://falconmanagerpro.com/api/health
+
+# View K8s status
+kubectl get all
+kubectl describe ingress falcon-ingress
+
+# Check certificates
+kubectl describe managedcertificate falcon-managed-cert
+```
+
+---
+
+## 👨‍💻 Project Information
 
 **Project Location:**
 `/home/kthompson/Development/Projects/falconpy`
@@ -402,37 +554,49 @@ falconpy/
 **Primary User:**
 Kyle Thompson (kthompson@tachtech.net)
 
-**Documentation Maintained By:**
-Claude AI Assistant (Session: 2025-10-31)
+**Production URL:**
+https://falconmanagerpro.com
+
+**GCP Project:**
+falconmanagerpro
 
 **Last Updated:**
-2025-10-31 17:31:22
+2025-11-24
 
 ---
 
-## License & Usage
+## 📄 License & Usage
 
-This project uses:
+**This project uses:**
 - **FalconPy:** Public Domain (Unlicense)
 - **Project Scripts:** Internal use
+- **Flask/React:** MIT License
 
-Credentials and `.env` files are proprietary and confidential.
+**Proprietary & Confidential:**
+- API credentials (`.env` files)
+- TLS certificates (`.pem` files)
+- Customer data
 
 ---
 
-## Acknowledgments
+## 🎉 Acknowledgments
 
 **Built Using:**
 - Python 3.x
-- FalconPy v1.5.4
-- CrowdStrike Falcon Alerts API
+- React 18
+- CrowdStrike FalconPy SDK 1.4+
+- Flask 3.0
+- Google Kubernetes Engine
+- Cloudflare CDN
 
 **Special Thanks:**
 - CrowdStrike for FalconPy SDK
 - CrowdStrike Support for API documentation
+- Google Cloud Platform
+- Cloudflare
 
 ---
 
-**🎉 Project Complete and Production Ready!**
+**🚀 Production-Ready Enterprise Detection Management Platform**
 
-For questions about this documentation, refer to the individual files listed above.
+*For questions about this documentation, refer to the individual guide files listed above.*
