@@ -9,7 +9,7 @@
 
 ## Overview
 
-**Falcon Manager Pro** is a comprehensive web-based platform for managing CrowdStrike Falcon detections, incidents, hosts, and IOCs. It combines Python CLI tools with a full-stack web application (React + Flask) deployed on Google Kubernetes Engine with Cloudflare CDN and Full (Strict) TLS encryption.
+**Falcon Manager Pro** is a comprehensive web-based platform for managing CrowdStrike Falcon detections, incidents, hosts, hashes and IOCs. It combines Python CLI tools with a full-stack web application (React + Flask) deployed on Google Kubernetes Engine with Cloudflare CDN and Full (Strict) TLS encryption.  It gives SOC analysts a much cleaner, faster way to isolate and manage hosts. The UI is significantly improved over the native console and should help you streamline triage and remediation.
 
 ### Platform Components
 
