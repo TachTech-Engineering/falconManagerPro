@@ -580,6 +580,130 @@ scheduler.add_job(
 
 logger.info(f"🤖 Auto-trigger system initialized (checking every {AUTO_TRIGGER_INTERVAL}s)")
 
+def sync_detections_to_database():
+    """
+    Background job that syncs recent detections to database for historical storage
+    """
+    if not DB_ENABLED:
+        return
+    
+    try:
+        logger.info("🔄 Syncing detections to database...")
+        
+        # Get all active tenants
+        active_tenants = {}
+        for session_token, session_data in list(active_sessions.items()):
+            if datetime.utcnow() <= session_data['expires_at']:
+                tenant_id = session_data['tenant_id']
+                if tenant_id not in active_tenants:
+                    tenant = tenant_dao.get_by_id(tenant_id)
+                    if tenant:
+                        active_tenants[tenant_id] = tenant
+        
+        if not active_tenants:
+            logger.debug("No active tenants for detection sync")
+            return
+        
+        # Sync detections for each tenant
+        for tenant_id, tenant in active_tenants.items():
+            try:
+                # Create auth for this tenant
+                falcon_auth = OAuth2(
+                    client_id=tenant['crowdstrike_client_id'],
+                    client_secret=tenant['crowdstrike_client_secret'],
+                    base_url=tenant['crowdstrike_base_url']
+                )
+                
+                falcon_detect = Alerts(auth_object=falcon_auth)
+                
+                # Fetch last hour of detections
+                time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(hours=1)).isoformat()}Z'"
+                
+                response = falcon_detect.query_alerts(
+                    filter=time_filter,
+                    limit=1000,
+                    sort='created_timestamp.desc'
+                )
+                
+                if response.get('status_code') != 200:
+                    logger.warning(f"Failed to query detections for tenant {tenant_id}")
+                    continue
+                
+                detection_ids = response['body'].get('resources', []) or []
+                
+                if not detection_ids:
+                    logger.debug(f"No new detections for tenant {tenant_id}")
+                    continue
+                
+                # Get details
+                details_response = falcon_detect.get_alerts(ids=detection_ids)
+                
+                if details_response.get('status_code') != 200:
+                    logger.warning(f"Failed to get detection details for tenant {tenant_id}")
+                    continue
+                
+                detections_to_store = []
+                
+                for det in details_response['body'].get('resources', []):
+                    behaviors = det.get('behaviors', [{}])
+                    first_behavior = behaviors[0] if behaviors else {}
+                    device = det.get('device', {}) or {}
+                    
+                    # Extract severity properly - use multiple fallbacks
+                    severity_value = 'unknown'
+                    if det.get('max_severity_displayname'):
+                        severity_value = det['max_severity_displayname'].lower()
+                    elif det.get('severity_name'):
+                        severity_value = det['severity_name'].lower()
+                    elif det.get('max_severity'):
+                        severity_map = {10: 'informational', 20: 'low', 30: 'medium', 40: 'high', 50: 'critical', 70: 'critical'}
+                        severity_value = severity_map.get(det['max_severity'], 'unknown')
+                    
+                    # Detect if detection has hashes
+                    entities = det.get('entities', {}) or {}
+                    has_hash = bool(entities.get('sha256') or entities.get('md5') or entities.get('sha1'))
+                    
+                    detection_data = {
+                        'id': det.get('detection_id') or det.get('id'),
+                        'severity': severity_value,
+                        'status': det.get('status'),
+                        'timestamp': det.get('created_timestamp'),
+                        'host': device.get('hostname', 'Unknown'),
+                        'host_id': device.get('device_id'),
+                        'tactic': first_behavior.get('tactic', 'Unknown'),
+                        'technique': first_behavior.get('technique', ''),
+                        'description': first_behavior.get('description', ''),
+                        'has_hash': has_hash,
+                        'behavior': first_behavior.get('tactic', 'Unknown'),
+                        'assigned_to': det.get('assigned_to_name', 'Unassigned')
+                    }
+                    
+                    detections_to_store.append(detection_data)
+                
+                # Bulk insert/update
+                if detections_to_store:
+                    count = detection_dao.bulk_create_or_update(tenant_id, detections_to_store)
+                    logger.info(f"✅ Synced {count} detections for tenant {tenant_id}")
+                
+            except Exception as e:
+                logger.error(f"Error syncing detections for tenant {tenant_id}: {e}")
+        
+    except Exception as e:
+        logger.error(f"Error in sync_detections_to_database: {e}")
+
+
+# Schedule the detection sync job
+scheduler.add_job(
+    func=sync_detections_to_database,
+    trigger="interval",
+    minutes=10,  # Sync every 10 minutes
+    id='sync_detections',
+    name='Sync detections to database for historical storage',
+    replace_existing=True
+)
+
+logger.info(f"🔄 Detection sync system initialized (syncing every 10 minutes)")
+
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
@@ -897,15 +1021,18 @@ def logout():
 @app.route('/api/detections', methods=['GET'])
 @require_session
 def get_detections():
-    """Fetch detections from CrowdStrike"""
+    """Fetch detections directly from CrowdStrike API and return simplified list."""
     try:
-        falcon_detect = Alerts(auth_object=g.falcon_auth)
-        
         severity = request.args.get('severity')
         status = request.args.get('status')
         hours = int(request.args.get('hours', 24))
-        hours = min(hours, 720)
+        hours = min(hours, 720)  # Max 30 days
 
+        logger.info(f"🔴 Fetching {hours}h detections from CROWDSTRIKE API for tenant {g.tenant_id}")
+
+        falcon_detect = Alerts(auth_object=g.falcon_auth)
+
+        # Build Falcon filter
         time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(hours=hours)).isoformat()}Z'"
         filters = [time_filter]
 
@@ -915,7 +1042,7 @@ def get_detections():
             filters.append(f"status:'{status}'")
 
         filter_string = "+".join(filters)
-        
+
         response = falcon_detect.query_alerts(
             filter=filter_string,
             limit=MAX_DETECT_LIMIT,
@@ -923,38 +1050,218 @@ def get_detections():
         )
 
         if response.get('status_code') != 200:
+            logger.error(f"Failed to query detections: {response}")
             return jsonify({'error': 'Failed to query detections'}), 500
 
         detection_ids = response['body'].get('resources', []) or []
         if not detection_ids:
-            return jsonify({'detections': []})
+            logger.info("No detections returned from CrowdStrike API")
+            return jsonify({'detections': [], 'source': 'api', 'count': 0})
 
-        def get_severity(det, is_first=False):
-            """Extract severity from detection, checking multiple possible fields"""
-            if is_first:
-                logger.info(f"=== DETECTION FIELD DEBUG (Tenant: {g.tenant_id}) ===")
-                logger.info(f"Available keys: {list(det.keys())}")
-                logger.info(f"max_severity: {det.get('max_severity')}")
-                logger.info(f"max_severity_displayname: {det.get('max_severity_displayname')}")
-                logger.info(f"severity: {det.get('severity')}")
-                logger.info(f"severity_name: {det.get('severity_name')}")
-                behaviors = det.get('behaviors', [])
-                if behaviors:
-                    logger.info(f"First behavior keys: {list(behaviors[0].keys())}")
-                    logger.info(f"First behavior severity: {behaviors[0].get('severity')}")
-                logger.info(f"=== END DEBUG ===")
+        detections = []
+        is_first_detection = True
 
-            # Try max_severity_displayname first (most common)
-            if det.get('max_severity_displayname'):
-                return det['max_severity_displayname'].lower()
+        # Fetch detection details in batches
+        for i in range(0, len(detection_ids), MAX_DETECT_DETAIL_BATCH):
+            batch_ids = detection_ids[i:i + MAX_DETECT_DETAIL_BATCH]
+            details_response = falcon_detect.get_alerts(ids=batch_ids)
 
-            # Try severity_name
-            if det.get('severity_name'):
-                return det['severity_name'].lower()
+            if details_response.get('status_code') != 200:
+                logger.error(f"Failed to get detection details for batch {batch_ids}")
+                continue
 
-            # Try numeric max_severity
-            severity_num = det.get('max_severity')
-            if severity_num is not None:
+        for det in details_response['body'].get('resources', []):
+            # 🔥 Log ONE full raw detection so we can inspect MITRE fields
+            if is_first_detection:
+                try:
+                    print("=== RAW FALCON DETECTION SAMPLE ===")
+                    print(json.dumps(det, indent=2))
+                    print("=== END RAW FALCON DETECTION SAMPLE ===")
+                except Exception as log_err:
+                    print(f"Error logging raw detection: {log_err}")
+
+            # Behaviors (for older/EDR detections)
+            behaviors = det.get('behaviors') or []
+            first_behavior = behaviors[0] if behaviors and isinstance(behaviors[0], dict) else {}
+
+            device = det.get('device') or {}
+
+            # ✅ Proper severity
+            severity_value = get_severity(det, is_first=is_first_detection)
+            is_first_detection = False
+
+            # ✅ Prefer top-level Falcon MITRE fields, fall back to behaviors
+            tactic = (
+                det.get('tactic')
+                or first_behavior.get('tactic')
+                or 'Unknown'
+            )
+
+            technique_name = (
+                det.get('technique')
+                or first_behavior.get('technique')
+                or ''
+            )
+
+            scenario = (
+                det.get('scenario')
+                or first_behavior.get('scenario')
+                or ''
+            )
+
+            # ✅ Extract explicit MITRE array if present
+            mitre_entries = det.get('mitre_attack') or []
+
+            mitre_tactics = []
+            mitre_techniques = []
+
+            # From mitre_attack array
+            for m in mitre_entries:
+                if not isinstance(m, dict):
+                    continue
+                if m.get('tactic_id'):
+                    mitre_tactics.append(m['tactic_id'])
+                if m.get('technique_id'):
+                    mitre_techniques.append(m['technique_id'])
+
+            # Also consider top-level IDs
+            if det.get('tactic_id'):
+                mitre_tactics.append(det['tactic_id'])
+            if det.get('technique_id'):
+                mitre_techniques.append(det['technique_id'])
+
+            # Deduplicate while preserving order
+            def _dedupe(seq):
+                seen = set()
+                out = []
+                for x in seq:
+                    if x and x not in seen:
+                        seen.add(x)
+                        out.append(x)
+                return out
+
+            mitre_tactics = _dedupe(mitre_tactics)
+            mitre_techniques = _dedupe(mitre_techniques)
+
+            # ✅ Hash detection — handle both dict and list shapes
+            has_hash = False
+            entities = det.get('entities') or []
+
+            if isinstance(entities, dict):
+                # XDR-style shape: { "sha256": [...], ... }
+                hash_values = []
+                for key in ('sha256', 'sha1', 'md5'):
+                    val = entities.get(key)
+                    if isinstance(val, str):
+                        hash_values.append(val)
+                    elif isinstance(val, list):
+                        hash_values.extend(v for v in val if v)
+                has_hash = bool(hash_values)
+            elif isinstance(entities, list):
+                # Older/other APIs: list of entity dicts
+                for ent in entities:
+                    if isinstance(ent, dict) and any(ent.get(k) for k in ('sha256', 'sha1', 'md5')):
+                        has_hash = True
+                        break
+
+            detections.append({
+                'id': det.get('detection_id') or det.get('id'),
+                'name': tactic or 'Unknown',
+                'severity': severity_value,
+                'status': det.get('status'),
+                'timestamp': det.get('created_timestamp') or det.get('timestamp'),
+                'host': device.get('hostname', 'Unknown'),
+                'host_id': device.get('device_id'),
+                'behavior': tactic or 'Unknown',
+                'description': det.get('description') or first_behavior.get('description', ''),
+                'assigned_to': det.get('assigned_to_name', 'Unassigned'),
+                'has_hash': has_hash,
+
+                # 🔑 MITRE bits passed through to the frontend
+                'tactic': tactic,
+                'technique': technique_name,
+                'scenario': scenario,
+                'tactic_id': det.get('tactic_id'),
+                'technique_id': det.get('technique_id'),
+                'mitre_attack': mitre_entries,
+                'mitre_tactics': mitre_tactics,
+                'mitre_techniques': mitre_techniques,
+            })
+
+        return jsonify({
+            'detections': detections,
+            'source': 'api',
+            'count': len(detections)
+        })
+
+    except Exception as e:
+        logger.exception("Error fetching detections")
+        return jsonify({'error': str(e)}), 500
+
+def get_severity(det, is_first=False):
+    """Extract severity from detection, checking multiple possible fields"""
+    if is_first:
+        logger.info(f"=== DETECTION FIELD DEBUG (Tenant: {g.tenant_id}) ===")
+        logger.info(f"Available keys: {list(det.keys())}")
+        logger.info(f"max_severity: {det.get('max_severity')}")
+        logger.info(f"max_severity_displayname: {det.get('max_severity_displayname')}")
+        logger.info(f"severity: {det.get('severity')}")
+        logger.info(f"severity_name: {det.get('severity_name')}")
+        logger.info(f"=== END DEBUG ===")
+
+    # Try max_severity_displayname first (most common)
+    if det.get('max_severity_displayname'):
+        return det['max_severity_displayname'].lower()
+
+    # Try severity_name
+    if det.get('severity_name'):
+        return det['severity_name'].lower()
+
+    # Try numeric max_severity
+    severity_num = det.get('max_severity')
+    if severity_num is not None:
+        severity_map = {
+            10: 'informational',
+            20: 'low',
+            30: 'medium',
+            40: 'high',
+            50: 'critical',
+            70: 'critical'
+        }
+        mapped = severity_map.get(severity_num, 'unknown')
+        if mapped != 'unknown':
+            return mapped
+
+    # Try severity field (string or int)
+    severity_val = det.get('severity')
+    if severity_val:
+        if isinstance(severity_val, str):
+            return severity_val.lower()
+        elif isinstance(severity_val, int):
+            severity_map = {
+                10: 'informational',
+                20: 'low',
+                30: 'medium',
+                40: 'high',
+                50: 'critical',
+                70: 'critical'
+            }
+            mapped = severity_map.get(severity_val, 'unknown')
+            if mapped != 'unknown':
+                return mapped
+
+    # Try behavior severity as last resort
+    behaviors = det.get('behaviors', [])
+    if behaviors:
+        first_behavior = behaviors[0]
+        if first_behavior.get('severity_name'):
+            return first_behavior['severity_name'].lower()
+        
+        behavior_severity = first_behavior.get('severity')
+        if behavior_severity is not None:
+            if isinstance(behavior_severity, str):
+                return behavior_severity.lower()
+            elif isinstance(behavior_severity, int):
                 severity_map = {
                     10: 'informational',
                     20: 'low',
@@ -963,105 +1270,13 @@ def get_detections():
                     50: 'critical',
                     70: 'critical'
                 }
-                mapped = severity_map.get(severity_num, 'unknown')
+                mapped = severity_map.get(behavior_severity, 'unknown')
                 if mapped != 'unknown':
                     return mapped
 
-            # Try severity field (string or int)
-            severity_val = det.get('severity')
-            if severity_val:
-                if isinstance(severity_val, str):
-                    return severity_val.lower()
-                elif isinstance(severity_val, int):
-                    severity_map = {
-                        10: 'informational',
-                        20: 'low',
-                        30: 'medium',
-                        40: 'high',
-                        50: 'critical',
-                        70: 'critical'
-                    }
-                    mapped = severity_map.get(severity_val, 'unknown')
-                    if mapped != 'unknown':
-                        return mapped
-
-            # Try behavior severity as last resort
-            behaviors = det.get('behaviors', [])
-            if behaviors:
-                first_behavior = behaviors[0]
-
-                if first_behavior.get('severity_name'):
-                    return first_behavior['severity_name'].lower()
-
-                behavior_severity = first_behavior.get('severity')
-                if behavior_severity is not None:
-                    if isinstance(behavior_severity, str):
-                        return behavior_severity.lower()
-                    elif isinstance(behavior_severity, int):
-                        severity_map = {
-                            10: 'informational',
-                            20: 'low',
-                            30: 'medium',
-                            40: 'high',
-                            50: 'critical',
-                            70: 'critical'
-                        }
-                        mapped = severity_map.get(behavior_severity, 'unknown')
-                        if mapped != 'unknown':
-                            return mapped
-
-            if is_first:
-                logger.warning(f"Could not determine severity for detection {det.get('detection_id') or det.get('id')}")
-            return 'unknown'
-
-        detections = []
-        is_first_detection = True
-
-        for i in range(0, len(detection_ids), MAX_DETECT_DETAIL_BATCH):
-            batch_ids = detection_ids[i:i + MAX_DETECT_DETAIL_BATCH]
-            details_response = falcon_detect.get_alerts(ids=batch_ids)
-
-            if details_response.get('status_code') != 200:
-                continue
-
-            for det in details_response['body'].get('resources', []):
-                behaviors = det.get('behaviors', [{}])
-                first_behavior = behaviors[0] if behaviors else {}
-                device = det.get('device', {}) or {}
-
-                # Use comprehensive severity extraction
-                severity_value = get_severity(det, is_first=is_first_detection)
-                is_first_detection = False
-
-                # Detect if detection has hashes
-                entities = det.get('entities', {}) or {}
-                entity_values = det.get('entity_values', {}) or {}
-                has_sha256 = bool(entities.get('sha256') or entity_values.get('sha256s'))
-                has_md5 = bool(entities.get('md5') or entity_values.get('md5s'))
-                has_sha1 = bool(entities.get('sha1') or entity_values.get('sha1s'))
-                has_hash = has_sha256 or has_md5 or has_sha1
-
-                detections.append({
-                    'id': det.get('detection_id') or det.get('id'),
-                    'name': first_behavior.get('tactic', 'Unknown'),
-                    'severity': severity_value,
-                    'status': det.get('status'),
-                    'timestamp': det.get('created_timestamp'),
-                    'host': device.get('hostname', 'Unknown'),
-                    'host_id': device.get('device_id'),
-                    'behavior': first_behavior.get('tactic', 'Unknown'),
-                    'description': first_behavior.get('description', ''),
-                    'assigned_to': det.get('assigned_to_name', 'Unassigned'),
-                    'has_hash': has_hash,
-                    'technique': first_behavior.get('technique', ''),
-                    'scenario': first_behavior.get('scenario', '')
-                })
-
-        return jsonify({'detections': detections})
-
-    except Exception as e:
-        logger.exception("Error fetching detections")
-        return jsonify({'error': str(e)}), 500
+    if is_first:
+        logger.warning(f"Could not determine severity for detection {det.get('detection_id') or det.get('id')}")
+    return 'unknown'
 
 @app.route('/api/detections/<detection_id>/status', methods=['PATCH'])
 @require_session
@@ -2638,8 +2853,6 @@ def send_report_email(to_addresses, subject, body, filename, report_data, mimety
             server.starttls()
         server.send_message(msg)
 
-@app.route('/api/reports/generate', methods=['POST'])
-@require_session
 @app.route('/api/reports/generate', methods=['POST'])
 @require_session
 def generate_report():

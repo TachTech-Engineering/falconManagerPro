@@ -406,6 +406,204 @@ class IOCDAO:
                 WHERE tenant_id = %s AND id = %s
             """, (crowdstrike_id, tenant_id, ioc_id))
 
+class DetectionDAO:
+    """Data Access Object for Detections"""
+    
+    def __init__(self, db: Database):
+        self.db = db
+    
+    def create_or_update(self, tenant_id: str, detection_data: Dict[str, Any]) -> Optional[str]:
+        """Store or update a single detection"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO detections (
+                    tenant_id, detection_id, severity, status, timestamp,
+                    host_name, host_id, tactic, technique, description,
+                    has_hash, raw_data, first_seen, last_updated
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (tenant_id, detection_id) 
+                DO UPDATE SET
+                    severity = EXCLUDED.severity,
+                    status = EXCLUDED.status,
+                    timestamp = EXCLUDED.timestamp,
+                    host_name = EXCLUDED.host_name,
+                    host_id = EXCLUDED.host_id,
+                    tactic = EXCLUDED.tactic,
+                    technique = EXCLUDED.technique,
+                    description = EXCLUDED.description,
+                    has_hash = EXCLUDED.has_hash,
+                    raw_data = EXCLUDED.raw_data,
+                    last_updated = NOW()
+                RETURNING id
+            """, (
+                tenant_id,
+                detection_data.get('id'),
+                detection_data.get('severity'),
+                detection_data.get('status'),
+                detection_data.get('timestamp'),
+                detection_data.get('host'),
+                detection_data.get('host_id'),
+                detection_data.get('tactic') or detection_data.get('behavior'),
+                detection_data.get('technique'),
+                detection_data.get('description'),
+                detection_data.get('has_hash', False),
+                json.dumps(detection_data)
+            ))
+            result = cursor.fetchone()
+            return result['id'] if result else None
+    
+    def bulk_create_or_update(self, tenant_id: str, detections: List[Dict[str, Any]]) -> int:
+        """Bulk insert/update detections for performance"""
+        if not detections:
+            return 0
+        
+        with self.db.get_cursor() as cursor:
+            values = []
+            for det in detections:
+                values.append((
+                    tenant_id,
+                    det['id'],
+                    det.get('severity'),
+                    det.get('status'),
+                    det.get('timestamp'),
+                    det.get('host'),
+                    det.get('host_id'),
+                    det.get('tactic') or det.get('behavior'),
+                    det.get('technique'),
+                    det.get('description'),
+                    det.get('has_hash', False),
+                    json.dumps(det)
+                ))
+            
+            execute_values(cursor, """
+                INSERT INTO detections (
+                    tenant_id, detection_id, severity, status, timestamp,
+                    host_name, host_id, tactic, technique, description,
+                    has_hash, raw_data, first_seen, last_updated
+                ) VALUES %s
+                ON CONFLICT (tenant_id, detection_id) 
+                DO UPDATE SET
+                    severity = EXCLUDED.severity,
+                    status = EXCLUDED.status,
+                    timestamp = EXCLUDED.timestamp,
+                    host_name = EXCLUDED.host_name,
+                    host_id = EXCLUDED.host_id,
+                    tactic = EXCLUDED.tactic,
+                    technique = EXCLUDED.technique,
+                    description = EXCLUDED.description,
+                    has_hash = EXCLUDED.has_hash,
+                    raw_data = EXCLUDED.raw_data,
+                    last_updated = NOW()
+            """, values, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())")
+            
+            return len(detections)
+    
+    def get_by_timerange(self, tenant_id: str, hours: int = 24, 
+                         severity: Optional[str] = None,
+                         status: Optional[str] = None,
+                         limit: int = 5000) -> List[Dict[str, Any]]:
+        """Get detections from database for specified timerange"""
+        with self.db.get_cursor(commit=False) as cursor:
+            query = """
+                SELECT 
+                    detection_id as id,
+                    severity,
+                    status,
+                    timestamp,
+                    host_name as host,
+                    host_id,
+                    tactic as behavior,
+                    technique,
+                    description,
+                    has_hash,
+                    raw_data,
+                    first_seen,
+                    last_updated
+                FROM detections
+                WHERE tenant_id = %s
+                  AND timestamp > NOW() - INTERVAL '%s hours'
+            """
+            params = [tenant_id, hours]
+            
+            if severity:
+                query += " AND severity = %s"
+                params.append(severity)
+            
+            if status:
+                query += " AND status = %s"
+                params.append(status)
+            
+            query += " ORDER BY timestamp DESC LIMIT %s"
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+            
+            # Parse raw_data for additional fields
+            for det in results:
+                if det.get('raw_data'):
+                    try:
+                        raw = det['raw_data']
+                        if isinstance(raw, str):
+                            raw = json.loads(raw)
+                        # Merge useful fields from raw data
+                        det.update({
+                            'name': raw.get('name', det.get('behavior')),
+                            'assigned_to': raw.get('assigned_to', 'Unassigned'),
+                            'scenario': raw.get('scenario', '')
+                        })
+                    except:
+                        pass
+            
+            return results
+    
+    def get_statistics(self, tenant_id: str, days: int = 30) -> List[Dict[str, Any]]:
+        """Get detection statistics over time"""
+        with self.db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT 
+                    DATE(timestamp) as date,
+                    severity,
+                    COUNT(*) as count
+                FROM detections
+                WHERE tenant_id = %s
+                  AND timestamp > NOW() - INTERVAL '%s days'
+                GROUP BY DATE(timestamp), severity
+                ORDER BY date DESC
+            """, (tenant_id, days))
+            return cursor.fetchall()
+    
+    def get_count(self, tenant_id: str, hours: int = 24, 
+                  severity: Optional[str] = None) -> int:
+        """Get total detection count for timerange"""
+        with self.db.get_cursor(commit=False) as cursor:
+            query = """
+                SELECT COUNT(*) as count
+                FROM detections
+                WHERE tenant_id = %s
+                  AND timestamp > NOW() - INTERVAL '%s hours'
+            """
+            params = [tenant_id, hours]
+            
+            if severity:
+                query += " AND severity = %s"
+                params.append(severity)
+            
+            cursor.execute(query, params)
+            result = cursor.fetchone()
+            return result['count'] if result else 0
+    
+    def delete_old_records(self, tenant_id: str, days: int = 90) -> int:
+        """Delete detections older than specified days (data retention)"""
+        with self.db.get_cursor() as cursor:
+            cursor.execute("""
+                DELETE FROM detections
+                WHERE tenant_id = %s
+                  AND timestamp < NOW() - INTERVAL '%s days'
+            """, (tenant_id, days))
+            return cursor.rowcount
+
 
 def init_database():
     """
@@ -424,7 +622,6 @@ def init_database():
         return False
     return False
 
-
 # Initialize database connection
 db = Database()
 
@@ -433,3 +630,4 @@ tenant_dao = TenantDAO(db)
 playbook_dao = PlaybookDAO(db)
 execution_dao = ExecutionDAO(db)
 ioc_dao = IOCDAO(db)
+detection_dao = DetectionDAO(db)
