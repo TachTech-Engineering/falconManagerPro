@@ -1,0 +1,22 @@
+name: Secret Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  trufflehog:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run TruffleHog
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: .
+          # optional: only scan changed files in PR
+          # base: ${{ github.event.pull_request.base.sha }}
+          # head: ${{ github.event.pull_request.head.sha }}
