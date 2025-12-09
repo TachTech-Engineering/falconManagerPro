@@ -245,177 +245,243 @@ const FalconDashboard = () => {
     }
   }, [handleApiError]);
 
-  const fetchDashboardStats = useCallback(async () => {
-  try {
-    const response = await fetch(`${API_BASE}/detections?hours=${timeRange}`, { 
-      headers: getAuthHeaders() 
-    });
-    if (handleApiError(response)) return;
-    const data = await response.json();
-    if (data.detections) {
-      const stats = calculateDashboardStats(data.detections, parseInt(timeRange));
-      setDashboardStats(stats);
-    }
-  } catch (error) {
-    console.error('Error fetching dashboard stats:', error);
-  }
-}, [handleApiError, timeRange]);
+  const calculateDashboardStats = (detections, hours) => {
+    const now = new Date();
 
-const calculateDashboardStats = (detections, hours) => {
-  const now = new Date();
-  const severityCounts = { critical: 0, high: 0, medium: 0, low: 0, informational: 0, unknown: 0 };
-  const statusCounts = { new: 0, in_progress: 0, true_positive: 0, false_positive: 0, closed: 0, ignored: 0 };
-  
-  let bucketCount, bucketSizeHours, bucketLabel;
-  
-  if (hours <= 24) {
-    bucketCount = hours;
-    bucketSizeHours = 1;
-    bucketLabel = (bucket) => `${bucket.hour}:00`;
-  } else if (hours <= 168) {
-    bucketCount = Math.ceil(hours / 4);
-    bucketSizeHours = 4;
-    bucketLabel = (bucket) => {
-      const date = new Date(bucket.time);
-      const hour = date.getHours();
-      return `${date.getMonth() + 1}/${date.getDate()} ${hour}:00`;
-    };
-  } else {
-    bucketCount = Math.ceil(hours / 24);
-    bucketSizeHours = 24;
-    bucketLabel = (bucket) => {
-      const date = new Date(bucket.time);
-      return `${date.getMonth() + 1}/${date.getDate()}`;
-    };
-  }
-  
-  const timelineData = [];
-  
-  for (let i = bucketCount - 1; i >= 0; i--) {
-    const bucketTime = new Date(now.getTime() - i * bucketSizeHours * 60 * 60 * 1000);
-    timelineData.push({
-      time: bucketTime,
-      hour: bucketTime.getHours(),
-      label: bucketLabel({ time: bucketTime, hour: bucketTime.getHours() }),
+    const severityCounts = {
       critical: 0,
       high: 0,
       medium: 0,
       low: 0,
       informational: 0,
       unknown: 0,
-      total: 0
-    });
-  }
-  
-  detections.forEach(det => {
-    const severity = (det.severity || 'unknown').toLowerCase();
-    const status = (det.status || 'new').toLowerCase();
-    severityCounts[severity] = (severityCounts[severity] || 0) + 1;
-    statusCounts[status] = (statusCounts[status] || 0) + 1;
-    
-    if (det.timestamp) {
-      const detTime = new Date(det.timestamp);
-      const timeSinceDetection = (now - detTime) / (60 * 60 * 1000);
-      
-      if (timeSinceDetection >= 0 && timeSinceDetection < hours) {
-        const bucketIndex = Math.floor(timeSinceDetection / bucketSizeHours);
-        const timelineBucket = timelineData[timelineData.length - 1 - bucketIndex];
-        
-        if (timelineBucket && severity in timelineBucket) {
-          timelineBucket[severity]++;
-          timelineBucket.total++;
+    };
+
+    const statusCounts = {
+      new: 0,
+      in_progress: 0,
+      true_positive: 0,
+      false_positive: 0,
+      closed: 0,
+      ignored: 0,
+    };
+
+    // 🔑 Normalize ANY severity (string or number) into our buckets
+    const normalizeSeverity = (sev) => {
+      if (sev == null) return 'unknown';
+
+      const s = String(sev).toLowerCase();
+      const n = Number(s);
+
+      // Numeric CrowdStrike values
+      if (!Number.isNaN(n)) {
+          if (n <= 19) return 'informational';  // 0–19
+          if (n <= 39) return 'low';            // 20–39
+          if (n <= 59) return 'medium';         // 40–59
+          if (n <= 79) return 'high';           // 60–79
+          return 'critical';                    // 80–100+
+      }
+
+      // String-based severities
+      if (s === 'info') return 'informational';
+      if (['critical','high','medium','low','informational','unknown'].includes(s)) {
+        return s;
+      }
+
+      return 'unknown';
+    };
+
+
+    let bucketCount, bucketSizeHours, bucketLabel;
+
+    if (hours <= 24) {
+      bucketCount = hours;
+      bucketSizeHours = 1;
+      bucketLabel = (bucket) => `${bucket.hour}:00`;
+    } else if (hours <= 168) {
+      bucketCount = Math.ceil(hours / 4);
+      bucketSizeHours = 4;
+      bucketLabel = (bucket) => {
+        const date = new Date(bucket.time);
+        const hour = date.getHours();
+        return `${date.getMonth() + 1}/${date.getDate()} ${hour}:00`;
+      };
+    } else {
+      bucketCount = Math.ceil(hours / 24);
+      bucketSizeHours = 24;
+      bucketLabel = (bucket) => {
+        const date = new Date(bucket.time);
+        return `${date.getMonth() + 1}/${date.getDate()}`;
+      };
+    }
+
+    const timelineData = [];
+
+    // Build buckets from oldest → newest
+    for (let i = bucketCount - 1; i >= 0; i--) {
+      const bucketTime = new Date(now.getTime() - i * bucketSizeHours * 60 * 60 * 1000);
+      const hour = bucketTime.getHours();
+      timelineData.push({
+        time: bucketTime,
+        hour,
+        label: bucketLabel({ time: bucketTime, hour }),
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        informational: 0,
+        unknown: 0,
+        total: 0,
+      });
+    }
+
+    // Walk detections and populate counts + buckets
+    detections.forEach((det) => {
+      const severity = normalizeSeverity(det.severity);
+      const status = (det.status || 'new').toLowerCase();
+
+      // Severity tile counts
+      severityCounts[severity] = (severityCounts[severity] || 0) + 1;
+      statusCounts[status] = (statusCounts[status] || 0) + 1;
+
+      // Timeline buckets
+      if (det.timestamp) {
+        const detTime = new Date(det.timestamp);
+        const timeSinceDetection = (now - detTime) / (60 * 60 * 1000); // hours
+
+        if (timeSinceDetection >= 0 && timeSinceDetection < hours) {
+          const bucketIndex = Math.floor(timeSinceDetection / bucketSizeHours);
+          const timelineBucket = timelineData[timelineData.length - 1 - bucketIndex];
+
+          if (timelineBucket && Object.prototype.hasOwnProperty.call(timelineBucket, severity)) {
+            timelineBucket[severity] += 1;
+            timelineBucket.total += 1;
+          }
         }
       }
-    }
-  });
-  
-  return { 
-    severityCounts, 
-    statusCounts, 
-    timelineData, 
-    totalDetections: detections.length,
-    bucketSizeHours 
-  };
-};
+    });
 
-  const fetchVirusTotalData = async (hash) => {
-    const vtApiKey = sessionStorage.getItem('falcon_vt_key');
-    if (!vtApiKey) {
-      setVTData(prev => ({ ...prev, [hash]: { error: 'VirusTotal API key not configured' } }));
-      return;
-    }
-    
-    setVTLoading(prev => ({ ...prev, [hash]: true }));
-    try {
-      const response = await fetch(`${API_BASE}/virustotal/hash/${hash}`, {
-        headers: { ...getAuthHeaders(), 'X-VT-API-Key': vtApiKey }
-      });
-      if (handleApiError(response)) return;
-      
-      if (response.ok) {
-        const data = await response.json();
-        setVTData(prev => ({ ...prev, [hash]: data }));
-      } else {
-        const errorData = await response.json();
-        setVTData(prev => ({ ...prev, [hash]: { error: errorData.error || 'Failed to fetch VT data' } }));
+    return {
+      severityCounts,
+      statusCounts,
+      timelineData,
+      totalDetections: detections.length,
+      bucketSizeHours,
+    };
+  };
+
+
+    const fetchDashboardStats = useCallback(() => {
+      try {
+        if (!detections || detections.length === 0) {
+          setDashboardStats(null);
+          return;
+        }
+
+        const hours = parseInt(timeRange, 10) || 24;
+        const stats = calculateDashboardStats(detections, hours);
+        setDashboardStats(stats);
+
+      } catch (error) {
+        console.error('Error calculating dashboard stats:', error);
       }
-    } catch (error) {
-      console.error('Error fetching VirusTotal data:', error);
-      setVTData(prev => ({ ...prev, [hash]: { error: 'Error fetching VT data' } }));
-    } finally {
-      setVTLoading(prev => ({ ...prev, [hash]: false }));
-    }
-  };
+    }, [detections, timeRange]);
 
-  const fetchAutoTriggerStatus = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_BASE}/playbooks/auto-trigger/status`, { headers: getAuthHeaders() });
-      if (handleApiError(response)) return;
-      const data = await response.json();
-      setAutoTriggerStatus(data);
-    } catch (error) {
-      console.error('Error fetching auto-trigger status:', error);
-    }
-  }, [handleApiError]);
 
-  const fetchAllData = useCallback(() => {
-    if (!isAuthenticated) return;
+    const fetchVirusTotalData = async (hash) => {
+      const vtApiKey = sessionStorage.getItem('falcon_vt_key');
+      if (!vtApiKey) {
+        setVTData(prev => ({ ...prev, [hash]: { error: 'VirusTotal API key not configured' } }));
+        return;
+      }
+      
+      setVTLoading(prev => ({ ...prev, [hash]: true }));
+      try {
+        const response = await fetch(`${API_BASE}/virustotal/hash/${hash}`, {
+          headers: { ...getAuthHeaders(), 'X-VT-API-Key': vtApiKey }
+        });
+        if (handleApiError(response)) return;
+        
+        if (response.ok) {
+          const data = await response.json();
+          setVTData(prev => ({ ...prev, [hash]: data }));
+        } else {
+          const errorData = await response.json();
+          setVTData(prev => ({ ...prev, [hash]: { error: errorData.error || 'Failed to fetch VT data' } }));
+        }
+      } catch (error) {
+        console.error('Error fetching VirusTotal data:', error);
+        setVTData(prev => ({ ...prev, [hash]: { error: 'Error fetching VT data' } }));
+      } finally {
+        setVTLoading(prev => ({ ...prev, [hash]: false }));
+      }
+    };
+
+    const fetchAutoTriggerStatus = useCallback(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/playbooks/auto-trigger/status`, { headers: getAuthHeaders() });
+        if (handleApiError(response)) return;
+        const data = await response.json();
+        setAutoTriggerStatus(data);
+      } catch (error) {
+        console.error('Error fetching auto-trigger status:', error);
+      }
+    }, [handleApiError]);
+
+    const fetchAllData = useCallback(() => {
+      if (!isAuthenticated) return;
+
+      fetchDetections();
+      fetchHosts(false);
+      fetchIOCs();
+      fetchPlaybooks();
+
+      if (activeTab === 'playbooks') {
+        fetchAutoTriggerStatus();
+      }
+    }, [
+      isAuthenticated,
+      fetchDetections,
+      fetchHosts,
+      fetchIOCs,
+      fetchPlaybooks,
+      fetchAutoTriggerStatus,
+      activeTab,
+    ]);
+
+
+    useEffect(() => {
+  if (!isAuthenticated) return;
+
+  // Initial load
+  fetchDetections();
+  fetchHosts(false);
+  fetchIOCs();
+  fetchPlaybooks();
+
+  // Poll every 30 seconds
+  const interval = setInterval(() => {
     fetchDetections();
     fetchHosts(false);
-    fetchIOCs();
-    fetchPlaybooks();
-    if (activeTab === 'dashboard') fetchDashboardStats();
-    if (activeTab === 'playbooks') fetchAutoTriggerStatus();
-  }, [isAuthenticated, fetchDetections, fetchHosts, fetchIOCs, fetchPlaybooks, fetchDashboardStats, fetchAutoTriggerStatus, activeTab]);
+  }, 30000);
+
+  return () => clearInterval(interval);
+
+}, [isAuthenticated, fetchDetections, fetchHosts, fetchIOCs, fetchPlaybooks]);
 
   useEffect(() => {
-    if (isAuthenticated) {
-      fetchAllData();
-      const pollInterval = setInterval(() => {
-        fetchDetections();
-        fetchHosts(false);
-        if (activeTab === 'dashboard') fetchDashboardStats();
-        if (activeTab === 'playbooks') fetchAutoTriggerStatus();
-      }, 30000);
-      return () => clearInterval(pollInterval);
-    }
-  }, [isAuthenticated, fetchAllData, fetchDetections, fetchHosts, fetchDashboardStats, fetchAutoTriggerStatus, activeTab]);
+    if (!isAuthenticated) return;
+    fetchDashboardStats();
+  }, [isAuthenticated, detections, timeRange, fetchDashboardStats]);
 
   useEffect(() => {
-    const savedTenant = sessionStorage.getItem('falcon_tenant');
-    if (savedTenant) {
-      try {
-        setTenantInfo(JSON.parse(savedTenant));
-      } catch (e) {
-        console.error('Error parsing tenant info:', e);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-  if (detections && detections.length > 0) {
-    window.falconDetections = detections;
-    console.log('Loaded detections:', detections.length);
+  if (detections && detections.length) {
+    const bySeverity = detections.reduce((acc, d) => {
+      const sev = d.severity || '(empty)';
+      acc[sev] = (acc[sev] || 0) + 1;
+      return acc;
+    }, {});
+    console.log('Detections by severity from API:', bySeverity);
   }
 }, [detections]);
 
@@ -1722,9 +1788,10 @@ const calculateDashboardStats = (detections, hours) => {
       )}
       
       {showHelpSidebar && (
-        <HelpSidebar 
-          activeTab={activeTab} 
-          onClose={() => setShowHelpSidebar(false)} 
+        <HelpSidebar
+          activeTab={activeTab}
+          onClose={() => setShowHelpSidebar(false)}
+          onChangeTab={(tab) => setActiveTab(tab)}   // ⬅️ THIS is what makes the help tabs switch views
         />
       )}
 
@@ -3559,7 +3626,10 @@ const RTROutputDialog = ({ title, data, onClose }) => {
   );
 };
 
-const HelpSidebar = ({ activeTab, onClose }) => {
+// Assumes you already imported these icons at the top of your file:
+// import { Activity, Clock, AlertTriangle, Shield, TrendingUp, Search, CheckSquare, Zap, BookOpen, Server, Terminal, Database, AlertCircle, Hash, Globe, Play, List, RefreshCw, CheckCircle, Book, Lightbulb, ExternalLink, Command, X } from "lucide-react";
+
+const HelpSidebar = ({ activeTab, onClose, onChangeTab }) => {
   const helpContent = {
     dashboard: {
       title: "Security Analytics Dashboard",
@@ -3863,7 +3933,13 @@ const HelpSidebar = ({ activeTab, onClose }) => {
 
   return (
     <>
-      <div className="fixed inset-0 bg-black bg-opacity-50 z-40" onClick={onClose} />
+      {/* Backdrop */}
+      <div
+        className="fixed inset-0 bg-black bg-opacity-50 z-40"
+        onClick={onClose}
+      />
+
+      {/* Sidebar */}
       <div className="fixed right-0 top-0 h-full w-full max-w-3xl bg-white dark:bg-gray-800 shadow-2xl z-50 overflow-y-auto">
         {/* Header */}
         <div className="sticky top-0 bg-gradient-to-r from-blue-600 to-blue-700 text-white p-6 shadow-md z-10">
@@ -3872,11 +3948,13 @@ const HelpSidebar = ({ activeTab, onClose }) => {
               <Book className="w-8 h-8" />
               <div>
                 <h2 className="text-2xl font-bold">{currentHelp.title}</h2>
-                <p className="text-sm opacity-90">Documentation & Best Practices</p>
+                <p className="text-sm opacity-90">
+                  Documentation & Best Practices
+                </p>
               </div>
             </div>
-            <button 
-              onClick={onClose} 
+            <button
+              onClick={onClose}
               className="p-2 hover:bg-white hover:bg-opacity-20 rounded-lg transition-colors"
               title="Close help"
             >
@@ -3891,14 +3969,11 @@ const HelpSidebar = ({ activeTab, onClose }) => {
             {Object.keys(helpContent).map((tab) => (
               <button
                 key={tab}
-                onClick={() => {
-                  const event = new CustomEvent('changeTab', { detail: tab });
-                  window.dispatchEvent(event);
-                }}
+                onClick={() => onChangeTab && onChangeTab(tab)}
                 className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
                   activeTab === tab
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700'
+                    ? "bg-blue-600 text-white"
+                    : "bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-700"
                 }`}
               >
                 {helpContent[tab].title}
@@ -3912,7 +3987,7 @@ const HelpSidebar = ({ activeTab, onClose }) => {
           {currentHelp.sections.map((section, idx) => {
             const IconComponent = section.icon;
             return (
-              <div 
+              <div
                 key={idx}
                 className="bg-gradient-to-br from-blue-50 to-indigo-50 dark:from-blue-900/20 dark:to-indigo-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-5"
               >
@@ -3926,7 +4001,10 @@ const HelpSidebar = ({ activeTab, onClose }) => {
                 </div>
                 <div className="space-y-3">
                   {section.content.map((item, itemIdx) => (
-                    <div key={itemIdx} className="flex items-start space-x-3">
+                    <div
+                      key={itemIdx}
+                      className="flex items-start space-x-3"
+                    >
                       <div className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-blue-600 mt-2" />
                       <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed">
                         {item}
@@ -3947,7 +4025,13 @@ const HelpSidebar = ({ activeTab, onClose }) => {
               </h3>
             </div>
             <div className="space-y-2 text-sm text-gray-700 dark:text-gray-300">
-              <p>💡 Use <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">Ctrl+F</kbd> to search within help documentation</p>
+              <p>
+                💡 Use{" "}
+                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">
+                  Ctrl+F
+                </kbd>{" "}
+                to search within help documentation
+              </p>
               <p>⚡ All data auto-refreshes every 30 seconds - no manual refresh needed</p>
               <p>🔍 Use Advanced Search for complex FQL queries across detections</p>
               <p>🎯 Click Hash Analysis to find and close duplicate false positives in bulk</p>
@@ -4014,20 +4098,36 @@ const HelpSidebar = ({ activeTab, onClose }) => {
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
               <div className="flex items-center justify-between">
-                <span className="text-gray-700 dark:text-gray-300">Search Detections</span>
-                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">Ctrl+F</kbd>
+                <span className="text-gray-700 dark:text-gray-300">
+                  Search Detections
+                </span>
+                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">
+                  Ctrl+F
+                </kbd>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-700 dark:text-gray-300">Toggle Dark Mode</span>
-                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">D</kbd>
+                <span className="text-gray-700 dark:text-gray-300">
+                  Toggle Dark Mode
+                </span>
+                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">
+                  D
+                </kbd>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-700 dark:text-gray-300">Open Help</span>
-                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">?</kbd>
+                <span className="text-gray-700 dark:text-gray-300">
+                  Open Help
+                </span>
+                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">
+                  ?
+                </kbd>
               </div>
               <div className="flex items-center justify-between">
-                <span className="text-gray-700 dark:text-gray-300">Select All</span>
-                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">Ctrl+A</kbd>
+                <span className="text-gray-700 dark:text-gray-300">
+                  Select All
+                </span>
+                <kbd className="px-2 py-1 bg-white dark:bg-gray-800 rounded border dark:border-gray-700 font-mono text-xs">
+                  Ctrl+A
+                </kbd>
               </div>
             </div>
           </div>
@@ -4046,6 +4146,7 @@ const HelpSidebar = ({ activeTab, onClose }) => {
     </>
   );
 };
+
 
 
 // Export statement at the end of your App.js file

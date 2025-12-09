@@ -498,6 +498,54 @@ class DetectionDAO:
             """, values, template="(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())")
             
             return len(detections)
+
+    def get_by_tenant(self, tenant_id: str, hours: int = 24, severity: str = None, status: str = None, limit: int = 5000) -> List[Dict[str, Any]]:
+        """Get detections from database with filtering"""
+        with self.db.get_cursor(commit=False) as cursor:
+            # Build WHERE clauses
+            where_clauses = ["tenant_id = %s"]
+            params = [tenant_id]
+            
+            # Time filter
+            if hours:
+                where_clauses.append("timestamp >= NOW() - INTERVAL '%s hours'")
+                params.append(hours)
+            
+            # Severity filter
+            if severity and severity != 'all':
+                where_clauses.append("LOWER(severity) = LOWER(%s)")
+                params.append(severity)
+            
+            # Status filter
+            if status and status != 'all':
+                where_clauses.append("LOWER(status) = LOWER(%s)")
+                params.append(status)
+            
+            where_clause = " AND ".join(where_clauses)
+            
+            query = f"""
+                SELECT 
+                    detection_id,
+                    severity,
+                    status,
+                    timestamp,
+                    host_name,
+                    host_id,
+                    tactic,
+                    technique,
+                    description,
+                    has_hash,
+                    raw_data,
+                    first_seen
+                FROM detections
+                WHERE {where_clause}
+                ORDER BY timestamp DESC
+                LIMIT %s
+            """
+            params.append(limit)
+            
+            cursor.execute(query, params)
+            return cursor.fetchall()
     
     def get_by_timerange(self, tenant_id: str, hours: int = 24, 
                          severity: Optional[str] = None,
@@ -573,6 +621,23 @@ class DetectionDAO:
                 ORDER BY date DESC
             """, (tenant_id, days))
             return cursor.fetchall()
+
+    def get_hourly_stats(self, tenant_id: str, hours: int = 24):
+        with self.db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT 
+                    DATE_TRUNC('hour', timestamp) AS hour,
+                    severity,
+                    COUNT(*) AS count
+                FROM detections
+                WHERE tenant_id = %s
+                    AND timestamp >= NOW() - INTERVAL '%s hours'
+                GROUP BY hour, severity
+                ORDER BY hour ASC
+            """, (tenant_id, hours))
+
+            return cursor.fetchall()
+
     
     def get_count(self, tenant_id: str, hours: int = 24, 
                   severity: Optional[str] = None) -> int:

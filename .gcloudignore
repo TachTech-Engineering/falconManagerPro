@@ -1,0 +1,7 @@
+# Don't upload dependencies or VCS metadata
+.git
+.gitignore
+node_modules
+npm-debug.log
+yarn.lock
+# You can add other big junk here, but DO NOT exclude package.json or src
