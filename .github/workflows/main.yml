@@ -13,11 +13,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # recommended so TruffleHog can see history
+          fetch-depth: 0  # let TruffleHog see history
 
       - name: Run TruffleHog
-        uses: trufflesecurity/trufflehog-action@v1.1.2
+        uses: trufflesecurity/trufflehog@v3.91.2  # or any v3.x.y release
         with:
-          path: .   # scan the whole repo
-          # you can add extra_args here if you like, e.g.
-          # extra_args: "--only-verified"
+          path: .                      # repo to scan
+          extra_args: --results=verified,unknown
+          # version: v3.91.2           # optional, defaults to 'latest'
