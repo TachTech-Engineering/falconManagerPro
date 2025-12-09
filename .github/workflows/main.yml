@@ -12,11 +12,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # recommended so TruffleHog can see history
 
       - name: Run TruffleHog
-        uses: trufflesecurity/trufflehog@v3
+        uses: trufflesecurity/trufflehog-action@v1.1.2
         with:
-          path: .
-          # optional: only scan changed files in PR
-          # base: ${{ github.event.pull_request.base.sha }}
-          # head: ${{ github.event.pull_request.head.sha }}
+          path: .   # scan the whole repo
+          # you can add extra_args here if you like, e.g.
+          # extra_args: "--only-verified"
