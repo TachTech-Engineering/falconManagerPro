@@ -5,7 +5,8 @@ load_dotenv()
 from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
 from falconpy import Alerts, Hosts, Incidents, EventStreams, OAuth2, IOC, Intel, RealTimeResponse
-from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta, timezone
 import logging
 import time
 import requests
@@ -17,7 +18,6 @@ from reportlab.lib import colors
 import csv
 import os
 import json
-from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
 import uuid
 import hashlib
@@ -37,6 +37,148 @@ except Exception as e:
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ----------------------------------------------------------------------
+# Normalize Detection Helper
+# Converts Falcon API detection JSON to DB-compatible format
+# ----------------------------------------------------------------------
+def _map_numeric_severity(num):
+    """
+    Map Falcon numeric severity into our buckets.
+    Adjust thresholds as desired.
+    """
+    try:
+        n = int(num)
+    except (TypeError, ValueError):
+        return None
+
+    # 0–19 info, 20–39 low, 40–59 medium, 60–79 high, 80+ critical
+    if n <= 19:
+        return 'informational'
+    if n <= 39:
+        return 'low'
+    if n <= 59:
+        return 'medium'
+    if n <= 79:
+        return 'high'
+    return 'critical'
+
+
+def normalize_detection(det):
+    behaviors = det.get('behaviors') or []
+    first_behavior = behaviors[0] if behaviors else {}
+    device = det.get('device') or {}
+
+    entities = det.get('entities') or {}
+    has_hash = bool(entities.get('sha256') or entities.get('md5') or entities.get('sha1'))
+
+    # -----------------------------
+    # Derive severity robustly
+    # -----------------------------
+    severity = None
+    for key in ('max_severity_displayname', 'severity_name'):
+        val = det.get(key)
+        if isinstance(val, str) and val.strip():
+            severity = val.lower()
+            break
+
+    if severity is None:
+        for key in ('max_severity', 'severity'):
+            val = det.get(key)
+            if isinstance(val, str) and val.strip():
+                severity = val.lower()
+                break
+            mapped = _map_numeric_severity(val)
+            if mapped:
+                severity = mapped
+                break
+
+    if severity is None and first_behavior:
+        val = first_behavior.get('severity_name')
+        if isinstance(val, str) and val.strip():
+            severity = val.lower()
+        else:
+            bnum = first_behavior.get('severity')
+            mapped = _map_numeric_severity(bnum)
+            if mapped:
+                severity = mapped
+
+    if severity is None:
+        severity = 'unknown'
+
+    # -----------------------------
+    # ✅ MITRE extraction (works for idp + endpoint)
+    # -----------------------------
+    cs_raw = det  # you already store this
+
+    mitre_attack = cs_raw.get('mitre_attack') or []
+    # Normalize to a list of dicts
+    if not isinstance(mitre_attack, list):
+        mitre_attack = []
+
+    # Collect MITRE tactic/technique IDs from cs_raw.mitre_attack
+    tactic_keys = set()
+    technique_ids = set()
+
+    for m in mitre_attack:
+        if not isinstance(m, dict):
+            continue
+        tid = m.get('technique_id')
+        if isinstance(tid, str) and tid.strip():
+            technique_ids.add(tid.strip())
+        tac = m.get('tactic')
+        if isinstance(tac, str) and tac.strip():
+            tactic_keys.add(tac.strip())
+
+    # Fallback to cs_raw top-level tactic/technique fields (your sample has these)
+    if not tactic_keys:
+        tac = cs_raw.get('tactic')
+        if isinstance(tac, str) and tac.strip():
+            tactic_keys.add(tac.strip())
+
+    if not technique_ids:
+        tid = cs_raw.get('technique_id')
+        if isinstance(tid, str) and tid.strip():
+            technique_ids.add(tid.strip())
+
+    # Also keep your earlier behavior-based aggregation if endpoint behaviors exist
+    for b in behaviors:
+        if isinstance(b, dict):
+            tac = b.get('tactic')
+            if isinstance(tac, str) and tac.strip():
+                tactic_keys.add(tac.strip())
+            # NOTE: endpoint behavior "technique" may be a name, not T####; only add if it looks like an ID
+            tech = b.get('technique')
+            if isinstance(tech, str) and tech.strip() and tech.strip().startswith('T'):
+                technique_ids.add(tech.strip())
+
+    # Choose a single display tactic/technique (keep backwards compatibility)
+    display_tactic = first_behavior.get('tactic') or (next(iter(tactic_keys), None)) or cs_raw.get('tactic') or 'Unknown'
+    display_technique = first_behavior.get('technique') or cs_raw.get('technique') or ''
+
+    return {
+        'id': det.get('detection_id') or det.get('id'),
+        'severity': severity,
+        'status': det.get('status', 'new'),
+        'timestamp': det.get('created_timestamp') or det.get('timestamp'),
+        'host': device.get('hostname', 'Unknown'),
+        'host_id': device.get('device_id'),
+
+        # old fields
+        'tactic': display_tactic,
+        'technique': display_technique,
+        'description': first_behavior.get('description') or cs_raw.get('description') or '',
+        'behavior': first_behavior.get('tactic', 'Unknown'),
+        'assigned_to': det.get('assigned_to_name', 'Unassigned'),
+
+        # ✅ new fields for frontend mapping
+        'tactics': sorted(tactic_keys),                 # ["Initial Access", ...]
+        'technique_ids': sorted(technique_ids),         # ["T1078", ...]
+        'mitre_techniques': sorted(technique_ids),      # keep name expected by frontend
+
+        'has_hash': has_hash,
+        'cs_raw': det
+    }
 
 
 # Logging
@@ -63,12 +205,15 @@ SMTP_FROM = os.environ.get('SMTP_FROM', 'reports@tachtech.net')
 SMTP_USE_TLS = True
 
 # Auto-trigger configuration
-AUTO_TRIGGER_ENABLED = True
-AUTO_TRIGGER_INTERVAL = 60
-LOOKBACK_WINDOW = 5
-processed_detections = {}  # tenant_id -> set of detection_ids
+AUTO_TRIGGER_ENABLED = True        # master on/off switch
+AUTO_TRIGGER_INTERVAL = 60         # how often the background job runs (seconds)
+LOOKBACK_WINDOW = 5                # how far back to look for new detections (minutes)
+DETECTION_SYNC_INTERVAL = 600            
+DETECTION_SYNC_LOOKBACK_OVERLAP = 10              
+processed_detections = {}          # tenant_id -> set(detection_ids we've already processed)
 
-# Initialize scheduler
+
+# Initialize scheduler  ✅ must be before we use scheduler.add_job
 scheduler = BackgroundScheduler()
 scheduler.start()
 
@@ -168,7 +313,8 @@ def require_session(f):
 def auto_execute_playbooks():
     """
     Background job that checks for new detections across all tenants
-    and executes matching playbooks
+    and executes matching playbooks.
+    Runs for ALL active tenants, regardless of logged-in sessions.
     """
     if not AUTO_TRIGGER_ENABLED or not DB_ENABLED:
         return
@@ -176,26 +322,51 @@ def auto_execute_playbooks():
     try:
         logger.info("🤖 Auto-trigger: Checking detections across all tenants...")
         
-        # Get all active tenants with valid sessions
-        active_tenants = {}
-        for session_token, session_data in list(active_sessions.items()):
-            if datetime.utcnow() <= session_data['expires_at']:
-                tenant_id = session_data['tenant_id']
-                if tenant_id not in active_tenants:
-                    tenant = tenant_dao.get_by_id(tenant_id)
-                    if tenant:
-                        active_tenants[tenant_id] = tenant
+        # Query ALL active tenants from database (not just ones with sessions)
+        with db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT
+                    id,
+                    name,
+                    crowdstrike_client_id,
+                    crowdstrike_client_secret,
+                    COALESCE(crowdstrike_base_url, 'https://api.crowdstrike.com') AS crowdstrike_base_url
+                FROM tenants
+                WHERE is_active = true
+                  AND deleted_at IS NULL
+                  AND crowdstrike_client_id IS NOT NULL
+                  AND crowdstrike_client_secret IS NOT NULL
+            """)
+            tenants = cursor.fetchall()
         
-        if not active_tenants:
-            logger.debug("No active tenant sessions for auto-trigger")
+        if not tenants:
+            logger.debug("No active tenants for auto-trigger")
             return
         
+        logger.debug(f"Processing auto-triggers for {len(tenants)} tenant(s)...")
+        
         # Process each tenant
-        for tenant_id, tenant in active_tenants.items():
+        for tenant in tenants:
+            tenant_id = tenant['id']
+            tenant_name = tenant['name']
+            client_id = tenant['crowdstrike_client_id']
+            client_secret = tenant['crowdstrike_client_secret']
+            base_url = tenant['crowdstrike_base_url']
+            
             try:
-                process_tenant_auto_triggers(tenant)
+                # Build a minimal tenant dict for process_tenant_auto_triggers
+                tenant_obj = {
+                    'id': tenant_id,
+                    'name': tenant_name,
+                    'crowdstrike_client_id': client_id,
+                    'crowdstrike_client_secret': client_secret,
+                    'crowdstrike_base_url': base_url
+                }
+                
+                process_tenant_auto_triggers(tenant_obj)
+                
             except Exception as e:
-                logger.error(f"Error processing auto-triggers for tenant {tenant_id}: {e}")
+                logger.error(f"Error processing auto-triggers for tenant {tenant_name} ({tenant_id}): {e}")
         
     except Exception as e:
         logger.error(f"Error in auto_execute_playbooks: {e}")
@@ -582,127 +753,291 @@ logger.info(f"🤖 Auto-trigger system initialized (checking every {AUTO_TRIGGER
 
 def sync_detections_to_database():
     """
-    Background job that syncs recent detections to database for historical storage
+    Background job that syncs recent detections to database.
+    Uses gap detection to prevent missing data during outages.
+    Runs for ALL active tenants, regardless of logged-in sessions.
     """
     if not DB_ENABLED:
         return
     
     try:
-        logger.info("🔄 Syncing detections to database...")
+        logger.info("🔄 Starting detection sync for all active tenants...")
         
-        # Get all active tenants
-        active_tenants = {}
-        for session_token, session_data in list(active_sessions.items()):
-            if datetime.utcnow() <= session_data['expires_at']:
-                tenant_id = session_data['tenant_id']
-                if tenant_id not in active_tenants:
-                    tenant = tenant_dao.get_by_id(tenant_id)
-                    if tenant:
-                        active_tenants[tenant_id] = tenant
+        # Query ALL active tenants from database (not just ones with sessions)
+        with db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT
+                    id,
+                    name,
+                    crowdstrike_client_id,
+                    crowdstrike_client_secret,
+                    COALESCE(crowdstrike_base_url, 'https://api.crowdstrike.com') AS crowdstrike_base_url
+                FROM tenants
+                WHERE is_active = true
+                  AND deleted_at IS NULL
+                  AND crowdstrike_client_id IS NOT NULL
+                  AND crowdstrike_client_secret IS NOT NULL
+            """)
+            tenants = cursor.fetchall()
         
-        if not active_tenants:
-            logger.debug("No active tenants for detection sync")
+        if not tenants:
+            logger.debug("No active tenants found for detection sync")
             return
         
+        logger.info(f"Syncing detections for {len(tenants)} active tenant(s)...")
+        
         # Sync detections for each tenant
-        for tenant_id, tenant in active_tenants.items():
+        for tenant in tenants:
+            tenant_id = tenant['id']
+            tenant_name = tenant['name']
+            client_id = tenant['crowdstrike_client_id']
+            client_secret = tenant['crowdstrike_client_secret']
+            base_url = tenant['crowdstrike_base_url']
+            
             try:
-                # Create auth for this tenant
+                # Create fresh auth for this tenant
                 falcon_auth = OAuth2(
-                    client_id=tenant['crowdstrike_client_id'],
-                    client_secret=tenant['crowdstrike_client_secret'],
-                    base_url=tenant['crowdstrike_base_url']
+                    client_id=client_id,
+                    client_secret=client_secret,
+                    base_url=base_url
                 )
                 
                 falcon_detect = Alerts(auth_object=falcon_auth)
                 
-                # Fetch last hour of detections
-                time_filter = f"created_timestamp:>'{(datetime.utcnow() - timedelta(hours=1)).isoformat()}Z'"
+                # 🔍 CHECK FOR GAPS: Find the most recent detection timestamp in our DB
+                with db.get_cursor(commit=False) as cursor:
+                    cursor.execute("""
+                        SELECT MAX(timestamp) 
+                        FROM detections 
+                        WHERE tenant_id = %s
+                    """, (tenant_id,))
+                    result = cursor.fetchone()
+                    last_sync_time = result['max'] if result and result.get('max') else None
+                
+                # Get current time as timezone-aware
+                now_utc = datetime.now(timezone.utc)
+                
+                # Determine lookback window
+                if last_sync_time:
+                    # Ensure last_sync_time is timezone-aware
+                    if last_sync_time.tzinfo is None:
+                        last_sync_time = last_sync_time.replace(tzinfo=timezone.utc)
+                    
+                    # Calculate the gap since last sync
+                    time_since_last = now_utc - last_sync_time
+                    
+                    if time_since_last > timedelta(hours=1):
+                        # GAP DETECTED! Fetch everything since last sync
+                        lookback = last_sync_time
+                        logger.warning(
+                            f"⚠️ Gap detected for {tenant_name}: "
+                            f"{time_since_last.total_seconds()/3600:.1f} hours since last sync. "
+                            f"Fetching all detections since {lookback.isoformat()}"
+                        )
+                    else:
+                        # Normal operation - fetch last hour with overlap for safety
+                        lookback = now_utc - timedelta(hours=1, minutes=DETECTION_SYNC_LOOKBACK_OVERLAP)
+                        logger.debug(f"Normal sync for {tenant_name}: fetching last {60 + DETECTION_SYNC_LOOKBACK_OVERLAP} minutes")
+                else:
+                    # First time syncing this tenant - get last 24 hours
+                    lookback = now_utc - timedelta(hours=24)
+                    logger.info(f"First sync for {tenant_name}: fetching last 24 hours")
+                
+                # Remove timezone for CrowdStrike API (they want naive UTC)
+                time_filter = f"created_timestamp:>'{lookback.replace(tzinfo=None).isoformat()}Z'"
                 
                 response = falcon_detect.query_alerts(
                     filter=time_filter,
-                    limit=1000,
+                    limit=5000,
                     sort='created_timestamp.desc'
                 )
                 
                 if response.get('status_code') != 200:
-                    logger.warning(f"Failed to query detections for tenant {tenant_id}")
+                    logger.warning(f"Failed to query detections for tenant {tenant_name}")
                     continue
                 
                 detection_ids = response['body'].get('resources', []) or []
                 
                 if not detection_ids:
-                    logger.debug(f"No new detections for tenant {tenant_id}")
+                    logger.debug(f"No new detections for tenant {tenant_name}")
                     continue
                 
-                # Get details
-                details_response = falcon_detect.get_alerts(ids=detection_ids)
+                # Get details in batches
+                total_synced = 0
                 
-                if details_response.get('status_code') != 200:
-                    logger.warning(f"Failed to get detection details for tenant {tenant_id}")
-                    continue
+                for i in range(0, len(detection_ids), 500):
+                    batch_ids = detection_ids[i:i+500]
+                    details_response = falcon_detect.get_alerts(ids=batch_ids)
+                    
+                    if details_response.get('status_code') != 200:
+                        logger.warning(f"Failed to get detection details batch for tenant {tenant_name}")
+                        continue
+                    
+                    detections_to_store = []
+                    
+                    for det in details_response['body'].get('resources', []):
+                        normalized = normalize_detection(det)
+                        detections_to_store.append(normalized)
+                    
+                    # Bulk insert/update
+                    if detections_to_store:
+                        count = detection_dao.bulk_create_or_update(tenant_id, detections_to_store)
+                        total_synced += count
                 
-                detections_to_store = []
-                
-                for det in details_response['body'].get('resources', []):
-                    behaviors = det.get('behaviors', [{}])
-                    first_behavior = behaviors[0] if behaviors else {}
-                    device = det.get('device', {}) or {}
-                    
-                    # Extract severity properly - use multiple fallbacks
-                    severity_value = 'unknown'
-                    if det.get('max_severity_displayname'):
-                        severity_value = det['max_severity_displayname'].lower()
-                    elif det.get('severity_name'):
-                        severity_value = det['severity_name'].lower()
-                    elif det.get('max_severity'):
-                        severity_map = {10: 'informational', 20: 'low', 30: 'medium', 40: 'high', 50: 'critical', 70: 'critical'}
-                        severity_value = severity_map.get(det['max_severity'], 'unknown')
-                    
-                    # Detect if detection has hashes
-                    entities = det.get('entities', {}) or {}
-                    has_hash = bool(entities.get('sha256') or entities.get('md5') or entities.get('sha1'))
-                    
-                    detection_data = {
-                        'id': det.get('detection_id') or det.get('id'),
-                        'severity': severity_value,
-                        'status': det.get('status'),
-                        'timestamp': det.get('created_timestamp'),
-                        'host': device.get('hostname', 'Unknown'),
-                        'host_id': device.get('device_id'),
-                        'tactic': first_behavior.get('tactic', 'Unknown'),
-                        'technique': first_behavior.get('technique', ''),
-                        'description': first_behavior.get('description', ''),
-                        'has_hash': has_hash,
-                        'behavior': first_behavior.get('tactic', 'Unknown'),
-                        'assigned_to': det.get('assigned_to_name', 'Unassigned')
-                    }
-                    
-                    detections_to_store.append(detection_data)
-                
-                # Bulk insert/update
-                if detections_to_store:
-                    count = detection_dao.bulk_create_or_update(tenant_id, detections_to_store)
-                    logger.info(f"✅ Synced {count} detections for tenant {tenant_id}")
+                if total_synced > 0:
+                    logger.info(f"✅ {tenant_name}: Synced {total_synced} detections")
                 
             except Exception as e:
-                logger.error(f"Error syncing detections for tenant {tenant_id}: {e}")
+                logger.error(f"Error syncing detections for tenant {tenant_name}: {e}")
+                import traceback
+                traceback.print_exc()
         
     except Exception as e:
         logger.error(f"Error in sync_detections_to_database: {e}")
+        import traceback
+        traceback.print_exc()
 
 
-# Schedule the detection sync job
 scheduler.add_job(
     func=sync_detections_to_database,
     trigger="interval",
-    minutes=10,  # Sync every 10 minutes
+    seconds=DETECTION_SYNC_INTERVAL,  # ⬅️ Use variable instead of hardcoded minutes=10
     id='sync_detections',
     name='Sync detections to database for historical storage',
     replace_existing=True
 )
+logger.info(f"🔄 Detection sync initialized (syncing every {DETECTION_SYNC_INTERVAL}s / {DETECTION_SYNC_INTERVAL//60} minutes)")
 
-logger.info(f"🔄 Detection sync system initialized (syncing every 10 minutes)")
+
+# ---------------------------------------------------------------------------
+# FULL 30-DAY BACKFILL JOB (Runs once at startup)
+# ---------------------------------------------------------------------------
+
+
+def _parse_utc(s: str) -> datetime:
+    # accepts "2025-12-09T00:00:00Z" or ISO with offset
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def backfill_detections_30_days():
+    logger.info("Starting backfill...")
+
+    if not DB_ENABLED:
+        logger.warning("Database disabled — skipping backfill.")
+        return
+
+    # Optional targeted range via env vars
+    start_env = os.getenv("BACKFILL_START_UTC")
+    end_env   = os.getenv("BACKFILL_END_UTC")
+
+    if start_env and end_env:
+        start_time = _parse_utc(start_env)
+        end_time   = _parse_utc(end_env)
+        logger.info(f"[Backfill] Using explicit window: {start_time.isoformat()} -> {end_time.isoformat()}")
+    else:
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(days=30)
+        logger.info(f"[Backfill] Using default 30-day window: {start_time.isoformat()} -> {end_time.isoformat()}")
+
+    # Load tenants
+    try:
+        with tenant_dao.db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT
+                    id,
+                    crowdstrike_client_id,
+                    crowdstrike_client_secret,
+                    COALESCE(crowdstrike_base_url, 'https://api.crowdstrike.com') AS crowdstrike_base_url
+                FROM tenants
+                WHERE is_active = true
+                  AND deleted_at IS NULL
+            """)
+            tenants = cursor.fetchall()
+    except Exception as e:
+        logger.exception(f"[Backfill] Failed to load tenants from DB: {e}")
+        return
+
+    if not tenants:
+        logger.warning("[Backfill] No active tenants found, nothing to backfill.")
+        return
+
+    logger.info(f"[Backfill] Running backfill for {len(tenants)} tenants...")
+
+    for tenant in tenants:
+        try:
+            tenant_id = tenant.get("id") if isinstance(tenant, dict) else tenant[0]
+            client_id = tenant.get("crowdstrike_client_id") if isinstance(tenant, dict) else tenant[1]
+            client_secret = tenant.get("crowdstrike_client_secret") if isinstance(tenant, dict) else tenant[2]
+            base_url = tenant.get("crowdstrike_base_url") if isinstance(tenant, dict) else tenant[3]
+        except Exception as e:
+            logger.exception(f"[Backfill] Could not parse tenant row: {tenant} | err={e}")
+            continue
+
+        if not client_id or not client_secret:
+            logger.warning(f"[Backfill] Tenant {tenant_id} missing CrowdStrike creds, skipping.")
+            continue
+
+        logger.info(f"[Backfill] Tenant {tenant_id}: backfill starting.")
+
+        try:
+            falcon_auth = OAuth2(client_id=client_id, client_secret=client_secret, base_url=base_url)
+            alerts = Alerts(auth_object=falcon_auth)
+
+            # Build a bounded filter so we ONLY pull 12/9-12/11 (or 30 days by default)
+            # CrowdStrike filter syntax: created_timestamp:>'...' + created_timestamp:<'...'
+            filter_str = (
+                f"created_timestamp:>='{start_time.strftime('%Y-%m-%dT%H:%M:%SZ')}',"
+                f"created_timestamp:<'{end_time.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
+            )
+
+            all_ids = []
+            offset = None
+
+            while True:
+                resp = alerts.query_alerts(
+                    filter=filter_str,
+                    limit=5000,
+                    sort="created_timestamp.asc",
+                    offset=offset
+                )
+                body = resp.get("body") or {}
+                ids = body.get("resources") or []
+                meta = body.get("meta") or {}
+                next_offset = (meta.get("pagination") or {}).get("offset")
+
+                if not ids:
+                    break
+
+                all_ids.extend(ids)
+                logger.info(f"[Backfill] Tenant {tenant_id}: collected {len(all_ids)} ids so far...")
+
+                if not next_offset or next_offset == offset:
+                    break
+                offset = next_offset
+
+            logger.info(f"[Backfill] Tenant {tenant_id}: total ids in window = {len(all_ids)}")
+
+            # Fetch details and upsert
+            for i in range(0, len(all_ids), 500):
+                batch = all_ids[i:i+500]
+                detail = alerts.get_alerts(ids=batch)
+                resources = (detail.get("body") or {}).get("resources", []) or []
+
+                for det in resources:
+                    normalized = normalize_detection(det)
+                    detection_dao.create_or_update(tenant_id, normalized)
+
+            logger.info(f"[Backfill] Tenant {tenant_id}: backfill complete.")
+
+        except Exception as e:
+            logger.exception(f"[Backfill] Tenant {tenant_id} failed: {e}")
+
+    logger.info("Backfill completed for all tenants.")
 
 # ============================================================================
 # HELPER FUNCTIONS
