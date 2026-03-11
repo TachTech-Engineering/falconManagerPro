@@ -4,7 +4,7 @@ load_dotenv()
 
 from flask import Flask, jsonify, request, send_file, g
 from flask_cors import CORS
-from falconpy import Alerts, Hosts, Incidents, EventStreams, OAuth2, IOC, Intel, RealTimeResponse
+from falconpy import Alerts, Hosts, Incidents, EventStreams, OAuth2, IOC, Intel, RealTimeResponse, IOAExclusions, MLExclusions, SensorVisibilityExclusions, PreventionPolicies, FalconXSandbox
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
 import logging
@@ -178,6 +178,233 @@ def normalize_detection(det):
 
         'has_hash': has_hash,
         'cs_raw': det
+    }
+
+
+# ----------------------------------------------------------------------
+# Actor Correlation Service
+# Links detections to threat adversaries via multiple strategies
+# ----------------------------------------------------------------------
+
+# In-memory cache for actor MITRE mappings
+_actor_mitre_cache = {'actors': {}, 'technique_map': {}, 'last_refresh': None}
+ACTOR_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_actor_mitre_mapping(intel_client):
+    """
+    Fetch all actors and build technique->actor mapping.
+    Returns cache dict with actors and technique_map.
+    """
+    global _actor_mitre_cache
+
+    now = time.time()
+    if (_actor_mitre_cache['last_refresh'] and
+        now - _actor_mitre_cache['last_refresh'] < ACTOR_CACHE_TTL):
+        return _actor_mitre_cache
+
+    try:
+        # Fetch actor IDs
+        response = intel_client.query_actor_ids(limit=500)
+        if response['status_code'] != 200:
+            return _actor_mitre_cache
+
+        actor_ids = response['body'].get('resources', [])
+        if not actor_ids:
+            return _actor_mitre_cache
+
+        # Fetch actor details in batches
+        technique_to_actors = {}
+        actor_details = {}
+
+        for i in range(0, len(actor_ids), 100):
+            batch = actor_ids[i:i+100]
+            details_resp = intel_client.get_actor_entities(ids=batch)
+            if details_resp['status_code'] == 200:
+                for actor in details_resp['body'].get('resources', []):
+                    actor_id = actor.get('id')
+                    actor_details[actor_id] = {
+                        'id': actor_id,
+                        'name': actor.get('name'),
+                        'known_as': actor.get('known_as'),
+                        'origins': actor.get('origins', []),
+                        'motivations': actor.get('motivations', []),
+                        'short_description': actor.get('short_description', ''),
+                        'target_industries': actor.get('target_industries', []),
+                        'target_countries': actor.get('target_countries', [])
+                    }
+
+                    # Extract MITRE techniques from actor kill_chain
+                    for technique in actor.get('kill_chain', []):
+                        tech_id = technique.get('technique_id')
+                        if tech_id:
+                            if tech_id not in technique_to_actors:
+                                technique_to_actors[tech_id] = []
+                            technique_to_actors[tech_id].append(actor_id)
+
+        _actor_mitre_cache = {
+            'actors': actor_details,
+            'technique_map': technique_to_actors,
+            'last_refresh': now
+        }
+
+        logging.info(f"Refreshed actor cache: {len(actor_details)} actors, {len(technique_to_actors)} techniques")
+        return _actor_mitre_cache
+    except Exception as e:
+        logging.error(f"Error building actor MITRE mapping: {e}")
+        return _actor_mitre_cache
+
+
+def correlate_detection_with_actors(detection, intel_client, tenant_id):
+    """
+    Correlate a detection with threat actors using multiple strategies.
+
+    Strategies:
+    1. Native attribution (if CrowdStrike provides actor in detection)
+    2. MITRE ATT&CK technique overlap
+    3. Indicator matching (hash/domain lookups)
+
+    Returns list of correlated actors with confidence scores.
+    """
+    correlations = []
+    # Support both cs_raw (from normalize_detection) and raw_data (from database)
+    raw_data = detection.get('cs_raw') or detection.get('raw_data') or {}
+
+    # Enhanced logging for debugging
+    behaviors = raw_data.get('behaviors', [])
+    entities = raw_data.get('entities', {})
+    logging.info(f"[CORRELATE] Starting correlation for detection")
+    logging.info(f"[CORRELATE] - has cs_raw: {bool(raw_data)}")
+    logging.info(f"[CORRELATE] - behaviors count: {len(behaviors)}")
+    logging.info(f"[CORRELATE] - entities keys: {list(entities.keys()) if entities else []}")
+    logging.info(f"[CORRELATE] - sha256 count: {len(entities.get('sha256', []))}")
+    logging.info(f"[CORRELATE] - domain count: {len(entities.get('domain', []))}")
+
+    # Strategy 1: Native attribution from CrowdStrike
+    behaviors = raw_data.get('behaviors', [])
+    for behavior in behaviors:
+        actor_id = behavior.get('actor') or behavior.get('threat_actor')
+        if actor_id:
+            correlations.append({
+                'actor_id': actor_id,
+                'actor_name': actor_id,
+                'correlation_type': 'native',
+                'confidence_score': 1.0,
+                'matched_techniques': [],
+                'matched_indicators': []
+            })
+
+    # Strategy 2: MITRE technique overlap
+    cache = _get_actor_mitre_mapping(intel_client)
+    technique_map = cache.get('technique_map', {})
+    actor_details = cache.get('actors', {})
+
+    detection_techniques = set()
+    # Get techniques from detection
+    for tid in detection.get('technique_ids', []):
+        detection_techniques.add(tid.split('.')[0])  # Normalize sub-techniques
+
+    # Also check mitre_attack array in raw data
+    mitre_attack = raw_data.get('mitre_attack', [])
+    for m in mitre_attack:
+        if isinstance(m, dict):
+            tech_id = m.get('technique_id')
+            if tech_id:
+                detection_techniques.add(tech_id.split('.')[0])
+
+    logging.info(f"[CORRELATE] Strategy 2 - Detection has {len(detection_techniques)} MITRE techniques: {list(detection_techniques)}")
+    logging.info(f"[CORRELATE] - Actor cache has {len(technique_map)} techniques mapped to {len(actor_details)} actors")
+
+    actor_matches = {}
+    for technique_id in detection_techniques:
+        for actor_id in technique_map.get(technique_id, []):
+            if actor_id not in actor_matches:
+                actor_matches[actor_id] = []
+            actor_matches[actor_id].append(technique_id)
+
+    for actor_id, matched_techs in actor_matches.items():
+        # Skip if already found via native attribution
+        if any(c['actor_id'] == actor_id for c in correlations):
+            continue
+
+        # Confidence based on number of matching techniques
+        confidence = min(0.3 + (len(matched_techs) * 0.1), 0.8)
+
+        actor_info = actor_details.get(actor_id, {})
+        correlations.append({
+            'actor_id': actor_id,
+            'actor_name': actor_info.get('name', actor_id),
+            'correlation_type': 'mitre_overlap',
+            'confidence_score': confidence,
+            'matched_techniques': matched_techs,
+            'matched_indicators': [],
+            'actor_details': actor_info
+        })
+
+    # Strategy 3: Indicator matching (IOCs)
+    entities = raw_data.get('entities', {})
+    sha256_list = entities.get('sha256', [])
+    domains = entities.get('domain', [])
+    md5_list = entities.get('md5', [])
+    ip_list = entities.get('ip_address', [])
+
+    indicators_to_search = sha256_list[:3] + domains[:3] + md5_list[:2] + ip_list[:2]
+    found_indicators = []  # Store indicator details
+
+    logging.info(f"[CORRELATE] Strategy 3 - Searching {len(indicators_to_search)} IOCs: {[i[:20]+'...' if len(i)>20 else i for i in indicators_to_search]}")
+
+    if indicators_to_search:
+        try:
+            for indicator in indicators_to_search:
+                search_resp = intel_client.query_indicator_ids(
+                    filter=f"indicator:'{indicator}'",
+                    limit=10
+                )
+                if search_resp['status_code'] == 200:
+                    indicator_ids = search_resp['body'].get('resources', [])
+                    logging.info(f"[CORRELATE] - IOC '{indicator[:30]}...' found {len(indicator_ids)} matches in Intel DB")
+                    if indicator_ids:
+                        ind_details = intel_client.get_indicator_entities(ids=indicator_ids[:5])
+                        if ind_details['status_code'] == 200:
+                            for ind in ind_details['body'].get('resources', []):
+                                # Extract indicator details
+                                malware_families = ind.get('malware_families', [])
+                                labels = ind.get('labels', [])
+                                threat_types = ind.get('threat_types', [])
+
+                                found_indicators.append({
+                                    'indicator_id': ind.get('id'),
+                                    'indicator_value': indicator,
+                                    'indicator_type': ind.get('type', 'unknown'),
+                                    'malware_families': [m.get('value', m) if isinstance(m, dict) else m for m in malware_families],
+                                    'labels': [l.get('name', l) if isinstance(l, dict) else l for l in labels],
+                                    'threat_types': [t.get('value', t) if isinstance(t, dict) else t for t in threat_types],
+                                    'confidence': ind.get('confidence', 0),
+                                    'last_updated': ind.get('last_updated'),
+                                    'description': ind.get('description', '')[:200] if ind.get('description') else ''
+                                })
+
+                                # Also extract actors from this indicator
+                                for actor_ref in ind.get('actors', []):
+                                    actor_id = actor_ref.get('id') if isinstance(actor_ref, dict) else actor_ref
+                                    if not any(c['actor_id'] == actor_id for c in correlations):
+                                        correlations.append({
+                                            'actor_id': actor_id,
+                                            'actor_name': actor_ref.get('name', actor_id) if isinstance(actor_ref, dict) else actor_id,
+                                            'correlation_type': 'indicator_match',
+                                            'confidence_score': 0.9,
+                                            'matched_techniques': [],
+                                            'matched_indicators': [indicator]
+                                        })
+        except Exception as e:
+            logging.warning(f"Indicator search failed: {e}")
+
+    # Sort by confidence
+    correlations.sort(key=lambda x: x['confidence_score'], reverse=True)
+
+    return {
+        'actors': correlations[:10],
+        'indicators': found_indicators[:15]
     }
 
 
@@ -1410,6 +1637,178 @@ def get_detections():
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
+
+@app.route('/api/detections/<detection_id>/debug', methods=['GET'])
+@require_session
+def debug_detection_structure(detection_id):
+    """
+    Debug endpoint to inspect what correlation-relevant fields a detection has.
+    Returns the raw structure and identifies what can be matched.
+    """
+    try:
+        # Get detection from database
+        detection = detection_dao.get_by_id(g.tenant_id, detection_id)
+        if not detection:
+            return jsonify({'error': 'Detection not found'}), 404
+
+        raw_data = detection.get('raw_data', {})
+
+        # Extract correlation-relevant fields
+        behaviors = raw_data.get('behaviors', [])
+        entities = raw_data.get('entities', {})
+        mitre_attack = raw_data.get('mitre_attack', [])
+
+        # Check for native actor attribution
+        native_actors = []
+        for b in behaviors:
+            actor = b.get('actor') or b.get('threat_actor')
+            if actor:
+                native_actors.append(actor)
+
+        # Check for MITRE techniques
+        technique_ids = set()
+        for m in mitre_attack:
+            if isinstance(m, dict):
+                tid = m.get('technique_id')
+                if tid:
+                    technique_ids.add(tid)
+        # Also check top-level
+        if raw_data.get('technique_id'):
+            technique_ids.add(raw_data.get('technique_id'))
+
+        # Check for IOCs
+        iocs = {
+            'sha256': entities.get('sha256', []),
+            'md5': entities.get('md5', []),
+            'sha1': entities.get('sha1', []),
+            'domain': entities.get('domain', []),
+            'ip_address': entities.get('ip_address', []),
+            'file_name': entities.get('file_name', []),
+            'command_line': entities.get('command_line', [])[:3] if entities.get('command_line') else []
+        }
+
+        # Summary
+        has_native_actor = len(native_actors) > 0
+        has_mitre = len(technique_ids) > 0
+        has_hashes = bool(iocs['sha256'] or iocs['md5'] or iocs['sha1'])
+        has_network = bool(iocs['domain'] or iocs['ip_address'])
+
+        correlation_potential = []
+        if has_native_actor:
+            correlation_potential.append('native_attribution')
+        if has_mitre:
+            correlation_potential.append('mitre_overlap')
+        if has_hashes or has_network:
+            correlation_potential.append('indicator_match')
+
+        return jsonify({
+            'detection_id': detection_id,
+            'correlation_potential': correlation_potential,
+            'summary': {
+                'has_native_actor': has_native_actor,
+                'has_mitre_techniques': has_mitre,
+                'has_hashes': has_hashes,
+                'has_network_iocs': has_network,
+                'can_correlate': len(correlation_potential) > 0
+            },
+            'fields': {
+                'native_actors': native_actors,
+                'mitre_techniques': list(technique_ids),
+                'iocs': iocs,
+                'behavior_count': len(behaviors),
+                'mitre_attack_count': len(mitre_attack)
+            },
+            'raw_keys': list(raw_data.keys()) if raw_data else [],
+            'entities_keys': list(entities.keys()) if entities else []
+        })
+
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/detections/debug/sample', methods=['GET'])
+@require_session
+def debug_sample_detections():
+    """
+    Check a sample of detections to see correlation potential across the dataset.
+    """
+    try:
+        # Get a sample of recent detections
+        detections = detection_dao.get_by_tenant(
+            tenant_id=g.tenant_id,
+            hours=168,  # Last 7 days
+            limit=100
+        )
+
+        stats = {
+            'total_sampled': len(detections),
+            'with_native_actors': 0,
+            'with_mitre_techniques': 0,
+            'with_hashes': 0,
+            'with_network_iocs': 0,
+            'can_correlate': 0,
+            'sample_iocs': []
+        }
+
+        for det in detections:
+            raw_data = det.get('raw_data', {})
+            behaviors = raw_data.get('behaviors', [])
+            entities = raw_data.get('entities', {})
+            mitre_attack = raw_data.get('mitre_attack', [])
+
+            # Check native actors
+            has_native = any(b.get('actor') or b.get('threat_actor') for b in behaviors)
+            if has_native:
+                stats['with_native_actors'] += 1
+
+            # Check MITRE
+            has_mitre = bool(mitre_attack) or bool(raw_data.get('technique_id'))
+            if has_mitre:
+                stats['with_mitre_techniques'] += 1
+
+            # Check hashes
+            has_hashes = bool(entities.get('sha256') or entities.get('md5'))
+            if has_hashes:
+                stats['with_hashes'] += 1
+                # Collect sample IOCs (first few)
+                if len(stats['sample_iocs']) < 5:
+                    for h in (entities.get('sha256', []) + entities.get('md5', []))[:1]:
+                        stats['sample_iocs'].append({'type': 'hash', 'value': h[:20] + '...' if len(h) > 20 else h})
+
+            # Check network
+            has_network = bool(entities.get('domain') or entities.get('ip_address'))
+            if has_network:
+                stats['with_network_iocs'] += 1
+                if len(stats['sample_iocs']) < 5:
+                    for d in entities.get('domain', [])[:1]:
+                        stats['sample_iocs'].append({'type': 'domain', 'value': d})
+
+            # Can correlate if any method possible
+            if has_native or has_mitre or has_hashes or has_network:
+                stats['can_correlate'] += 1
+
+        # Calculate percentages
+        total = stats['total_sampled'] or 1
+        stats['percentages'] = {
+            'with_native_actors': f"{(stats['with_native_actors'] / total * 100):.1f}%",
+            'with_mitre_techniques': f"{(stats['with_mitre_techniques'] / total * 100):.1f}%",
+            'with_hashes': f"{(stats['with_hashes'] / total * 100):.1f}%",
+            'with_network_iocs': f"{(stats['with_network_iocs'] / total * 100):.1f}%",
+            'can_correlate': f"{(stats['can_correlate'] / total * 100):.1f}%"
+        }
+
+        return jsonify(stats)
+
+    except Exception as e:
+        logger.error(f"Error in sample debug endpoint: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/detections/<detection_id>/status', methods=['PATCH'])
 @require_session
 def update_detection_status(detection_id):
@@ -1637,6 +2036,180 @@ def advanced_search():
         logger.exception("Error in advanced search")
         return jsonify({'error': str(e)}), 500
 
+
+# ----------------------------------------------------------------------
+# On-Demand Detection Refresh & Actor Correlation Endpoints
+# ----------------------------------------------------------------------
+
+@app.route('/api/detections/<detection_id>/refresh', methods=['POST'])
+@require_session
+def refresh_single_detection(detection_id):
+    """
+    Re-fetch a single detection from CrowdStrike API and update database.
+    Returns updated detection with fresh data.
+    """
+    try:
+        falcon_alerts = Alerts(auth_object=g.falcon_auth)
+
+        # Fetch fresh data from CrowdStrike
+        response = falcon_alerts.get_alerts(ids=[detection_id])
+
+        if response.get('status_code') != 200:
+            return jsonify({
+                'error': 'Failed to fetch detection from CrowdStrike',
+                'details': response['body'].get('errors', [])
+            }), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        if not resources:
+            return jsonify({'error': 'Detection not found'}), 404
+
+        raw_detection = resources[0]
+
+        # Normalize the detection
+        normalized = normalize_detection(raw_detection)
+
+        # Update database if enabled
+        if DB_ENABLED:
+            detection_dao.create_or_update(g.tenant_id, normalized)
+            logger.info(f"Refreshed detection {detection_id} in database")
+
+        return jsonify({
+            'status': 'success',
+            'detection': normalized,
+            'refreshed_at': datetime.now(timezone.utc).isoformat()
+        })
+
+    except Exception as e:
+        logger.exception(f"Error refreshing detection {detection_id}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/detections/<detection_id>/actors', methods=['GET'])
+@require_session
+def get_detection_actors(detection_id):
+    """
+    Get threat actors associated with a detection.
+    Computes correlation using multiple strategies.
+    """
+    try:
+        force_refresh = request.args.get('refresh', 'false').lower() == 'true'
+        logger.info(f"[ACTORS] Fetching actors for detection: {detection_id}")
+
+        # Fetch detection data - use efficient single lookup
+        detection = None
+        if DB_ENABLED:
+            detection = detection_dao.get_by_id(g.tenant_id, detection_id)
+            if detection:
+                logger.info(f"[ACTORS] Found detection in DB")
+
+        if not detection:
+            # Fetch from API
+            logger.info(f"[ACTORS] Detection not in DB, fetching from CrowdStrike API")
+            falcon_alerts = Alerts(auth_object=g.falcon_auth)
+            response = falcon_alerts.get_alerts(ids=[detection_id])
+            if response.get('status_code') != 200 or not response['body'].get('resources'):
+                logger.warning(f"[ACTORS] Detection not found in API: {detection_id}")
+                return jsonify({'error': 'Detection not found'}), 404
+            detection = normalize_detection(response['body']['resources'][0])
+            logger.info(f"[ACTORS] Fetched from API with techniques: {detection.get('technique_ids', [])}")
+
+        # Perform correlation
+        intel = Intel(auth_object=g.falcon_auth)
+        correlation_result = correlate_detection_with_actors(detection, intel, g.tenant_id)
+        actors = correlation_result.get('actors', [])
+        indicators = correlation_result.get('indicators', [])
+        logger.info(f"[ACTORS] Found {len(actors)} actors and {len(indicators)} indicators for {detection_id}")
+
+        return jsonify({
+            'detection_id': detection_id,
+            'actors': actors,
+            'indicators': indicators,
+            'source': 'computed'
+        })
+
+    except Exception as e:
+        logger.exception(f"Error getting actors for detection {detection_id}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/detections/batch-correlate', methods=['POST'])
+@require_session
+def batch_correlate_detections():
+    """
+    Correlate multiple detections with actors in batch.
+    Useful for background processing.
+    """
+    try:
+        data = request.json or {}
+        detection_ids = data.get('detection_ids', [])
+
+        if not detection_ids:
+            return jsonify({'error': 'detection_ids required'}), 400
+
+        if len(detection_ids) > 50:
+            return jsonify({'error': 'Maximum 50 detections per batch'}), 400
+
+        intel = Intel(auth_object=g.falcon_auth)
+        falcon_alerts = Alerts(auth_object=g.falcon_auth)
+
+        results = []
+
+        # Fetch all detections
+        response = falcon_alerts.get_alerts(ids=detection_ids[:1000])
+        if response.get('status_code') != 200:
+            return jsonify({'error': 'Failed to fetch detections'}), 500
+
+        for raw_det in response['body'].get('resources', []):
+            detection = normalize_detection(raw_det)
+            det_id = detection.get('id')
+
+            correlation_result = correlate_detection_with_actors(detection, intel, g.tenant_id)
+            actors = correlation_result.get('actors', [])
+            indicators = correlation_result.get('indicators', [])
+
+            results.append({
+                'detection_id': det_id,
+                'actor_count': len(actors),
+                'indicator_count': len(indicators),
+                'top_actor': actors[0] if actors else None,
+                'top_indicator': indicators[0] if indicators else None
+            })
+
+        return jsonify({
+            'status': 'success',
+            'processed': len(results),
+            'results': results
+        })
+
+    except Exception as e:
+        logger.exception("Error in batch correlation")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/intel/actors/<actor_id>', methods=['GET'])
+@require_session
+def get_actor_detail(actor_id):
+    """Get detailed information for a single actor."""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+
+        response = intel.get_actor_entities(ids=[actor_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to fetch actor'}), response['status_code']
+
+        actors = response['body'].get('resources', [])
+        if not actors:
+            return jsonify({'error': 'Actor not found'}), 404
+
+        return jsonify({'actor': actors[0]})
+
+    except Exception as e:
+        logger.exception(f"Error fetching actor {actor_id}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/events/recent', methods=['GET'])
 @require_session
 def get_recent_events():
@@ -1814,6 +2387,176 @@ def lift_containment(device_id):
 
         return jsonify({'status': 'success', 'action': 'lift_containment', 'device_id': device_id})
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# Sensor Health
+# ============================================================================
+
+@app.route('/api/sensor-health', methods=['GET'])
+@require_session
+def get_sensor_health():
+    """Get sensor health metrics across all hosts"""
+    try:
+        from datetime import datetime, timedelta, timezone
+
+        falcon_hosts = Hosts(auth_object=g.falcon_auth)
+
+        # Fetch all hosts with extended details
+        all_hosts = []
+        offset_token = None
+        batch_number = 0
+
+        while True:
+            batch_number += 1
+            query_params = {
+                'limit': 5000,
+                'sort': 'last_seen.desc'
+            }
+            if offset_token:
+                query_params['offset'] = offset_token
+
+            response = falcon_hosts.query_devices_by_filter_scroll(**query_params)
+
+            if response.get('status_code') != 200:
+                if batch_number == 1:
+                    return jsonify({'error': 'Failed to query hosts'}), 500
+                break
+
+            body = response.get('body', {})
+            host_ids = body.get('resources', []) or []
+
+            if not host_ids:
+                break
+
+            meta = body.get('meta', {})
+            pagination = meta.get('pagination', {})
+            offset_token = pagination.get('offset')
+
+            # Get detailed host info including RFM status
+            details_response = falcon_hosts.get_device_details(ids=host_ids)
+
+            if details_response.get('status_code') == 200:
+                for host in details_response['body'].get('resources', []):
+                    all_hosts.append(host)
+
+            if not offset_token or batch_number >= 20:
+                break
+            time.sleep(0.1)
+
+        # Calculate health metrics
+        now = datetime.now(timezone.utc)
+        offline_threshold = now - timedelta(hours=24)
+        stale_threshold = now - timedelta(days=7)
+        very_stale_threshold = now - timedelta(days=30)
+
+        # Collect version info to find latest
+        versions = {}
+        for host in all_hosts:
+            v = host.get('agent_version', '')
+            if v:
+                versions[v] = versions.get(v, 0) + 1
+
+        # Sort versions to find latest (simple string sort works for semver-ish)
+        sorted_versions = sorted(versions.keys(), reverse=True)
+        latest_version = sorted_versions[0] if sorted_versions else None
+
+        # Categorize hosts
+        online = []
+        offline = []
+        stale = []
+        very_stale = []
+        rfm = []
+        contained = []
+        outdated = []
+
+        for host in all_hosts:
+            last_seen_str = host.get('last_seen', '')
+            hostname = host.get('hostname', 'Unknown')
+            device_id = host.get('device_id', '')
+            agent_version = host.get('agent_version', '')
+            platform = host.get('platform_name', '')
+            os_version = host.get('os_version', '')
+            status = host.get('status', 'unknown')
+            rfm_mode = host.get('reduced_functionality_mode', 'no')
+
+            host_summary = {
+                'id': device_id,
+                'hostname': hostname,
+                'agent_version': agent_version,
+                'platform': platform,
+                'os': f"{platform} {os_version}".strip(),
+                'last_seen': last_seen_str,
+                'status': status,
+                'rfm': rfm_mode
+            }
+
+            # Parse last_seen
+            last_seen = None
+            if last_seen_str:
+                try:
+                    last_seen = datetime.fromisoformat(last_seen_str.replace('Z', '+00:00'))
+                except:
+                    pass
+
+            # Check RFM
+            if rfm_mode and rfm_mode.lower() == 'yes':
+                rfm.append(host_summary)
+
+            # Check contained
+            if status == 'contained':
+                contained.append(host_summary)
+
+            # Check online/offline/stale
+            if last_seen:
+                if last_seen < very_stale_threshold:
+                    very_stale.append(host_summary)
+                elif last_seen < stale_threshold:
+                    stale.append(host_summary)
+                elif last_seen < offline_threshold:
+                    offline.append(host_summary)
+                else:
+                    online.append(host_summary)
+            else:
+                offline.append(host_summary)
+
+            # Check outdated (not on latest version)
+            if latest_version and agent_version and agent_version != latest_version:
+                # Only flag if more than 2 minor versions behind
+                host_summary['latest_version'] = latest_version
+                outdated.append(host_summary)
+
+        # Build version distribution
+        version_distribution = [
+            {'version': v, 'count': c, 'is_latest': v == latest_version}
+            for v, c in sorted(versions.items(), key=lambda x: x[0], reverse=True)[:10]
+        ]
+
+        return jsonify({
+            'summary': {
+                'total': len(all_hosts),
+                'online': len(online),
+                'offline': len(offline),
+                'stale_7d': len(stale),
+                'stale_30d': len(very_stale),
+                'rfm': len(rfm),
+                'contained': len(contained),
+                'outdated': len(outdated)
+            },
+            'latest_version': latest_version,
+            'version_distribution': version_distribution,
+            'problem_hosts': {
+                'offline': offline[:50],
+                'stale': stale[:50],
+                'very_stale': very_stale[:50],
+                'rfm': rfm[:50],
+                'contained': contained[:50],
+                'outdated': outdated[:50]
+            }
+        })
+
+    except Exception as e:
+        logger.exception("Error fetching sensor health")
         return jsonify({'error': str(e)}), 500
 
 # ============================================================================
@@ -3514,6 +4257,872 @@ def debug_iocs_test():
         
     except Exception as e:
         return jsonify({'test': 'failed', 'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# Prevention Policies Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/prevention-policies', methods=['GET'])
+@require_session
+def get_prevention_policies():
+    """Get all prevention policies"""
+    try:
+        policies = PreventionPolicies(auth_object=g.falcon_auth)
+
+        # Query all policies
+        response = policies.query_policies(limit=500)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query policies', 'details': response['body']}), response['status_code']
+
+        policy_ids = response['body'].get('resources', [])
+        if not policy_ids:
+            return jsonify([])
+
+        # Get policy details
+        details_response = policies.get_policies(ids=policy_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get policy details'}), details_response['status_code']
+
+        return jsonify(details_response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error fetching prevention policies: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/prevention-policies/<policy_id>', methods=['GET'])
+@require_session
+def get_prevention_policy(policy_id):
+    """Get single prevention policy details"""
+    try:
+        policies = PreventionPolicies(auth_object=g.falcon_auth)
+        response = policies.get_policies(ids=[policy_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get policy'}), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        if not resources:
+            return jsonify({'error': 'Policy not found'}), 404
+
+        return jsonify(resources[0])
+    except Exception as e:
+        logging.error(f"Error fetching policy {policy_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/prevention-policies/<policy_id>/members', methods=['GET'])
+@require_session
+def get_prevention_policy_members(policy_id):
+    """Get hosts assigned to a prevention policy"""
+    try:
+        policies = PreventionPolicies(auth_object=g.falcon_auth)
+        response = policies.query_policy_members(id=policy_id, limit=500)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query policy members'}), response['status_code']
+
+        return jsonify({
+            'host_ids': response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', 0)
+        })
+    except Exception as e:
+        logging.error(f"Error fetching policy members: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/prevention-policies/<policy_id>/settings', methods=['PATCH'])
+@require_session
+def update_prevention_policy_settings(policy_id):
+    """Update prevention policy settings"""
+    try:
+        data = request.json
+        policies = PreventionPolicies(auth_object=g.falcon_auth)
+
+        # Build the update payload
+        update_body = {
+            'resources': [{
+                'id': policy_id,
+                'settings': data.get('settings', {}),
+            }]
+        }
+
+        if 'name' in data:
+            update_body['resources'][0]['name'] = data['name']
+        if 'description' in data:
+            update_body['resources'][0]['description'] = data['description']
+
+        response = policies.update_policies(body=update_body)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to update policy', 'details': response['body']}), response['status_code']
+
+        return jsonify({'success': True, 'policy': response['body'].get('resources', [{}])[0]})
+    except Exception as e:
+        logging.error(f"Error updating policy {policy_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# Intel Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/intel/actors', methods=['GET'])
+@require_session
+def get_intel_actors():
+    """Get threat actors"""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+
+        # Get query parameters
+        q = request.args.get('q', '')
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        # Query actors
+        response = intel.query_actor_ids(
+            q=q if q else None,
+            limit=limit,
+            offset=offset
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query actors', 'details': response['body']}), response['status_code']
+
+        actor_ids = response['body'].get('resources', [])
+        if not actor_ids:
+            return jsonify({'actors': [], 'total': 0})
+
+        # Get actor details
+        details_response = intel.get_actor_entities(ids=actor_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get actor details'}), details_response['status_code']
+
+        return jsonify({
+            'actors': details_response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', len(actor_ids))
+        })
+    except Exception as e:
+        logging.error(f"Error fetching intel actors: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/intel/indicators', methods=['GET'])
+@require_session
+def get_intel_indicators():
+    """Get threat indicators"""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+
+        # Get query parameters
+        q = request.args.get('q', '')
+        indicator_type = request.args.get('type', '')
+        limit = request.args.get('limit', 100, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        # Build filter
+        fql_filter = None
+        if indicator_type:
+            fql_filter = f"type:'{indicator_type}'"
+
+        # Query indicators
+        response = intel.query_indicator_ids(
+            q=q if q else None,
+            filter=fql_filter,
+            limit=limit,
+            offset=offset,
+            sort='published_date.desc'
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query indicators', 'details': response['body']}), response['status_code']
+
+        indicator_ids = response['body'].get('resources', [])
+        if not indicator_ids:
+            return jsonify({'indicators': [], 'total': 0})
+
+        # Get indicator details
+        details_response = intel.get_indicator_entities(ids=indicator_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get indicator details'}), details_response['status_code']
+
+        return jsonify({
+            'indicators': details_response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', len(indicator_ids))
+        })
+    except Exception as e:
+        logging.error(f"Error fetching intel indicators: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/intel/reports', methods=['GET'])
+@require_session
+def get_intel_reports():
+    """Get intelligence reports"""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+
+        # Get query parameters
+        q = request.args.get('q', '')
+        report_type = request.args.get('type', '')
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        # Build filter
+        fql_filter = None
+        if report_type:
+            fql_filter = f"type:'{report_type}'"
+
+        # Query reports
+        response = intel.query_report_ids(
+            q=q if q else None,
+            filter=fql_filter,
+            limit=limit,
+            offset=offset,
+            sort='created_date.desc'
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query reports', 'details': response['body']}), response['status_code']
+
+        report_ids = response['body'].get('resources', [])
+        if not report_ids:
+            return jsonify({'reports': [], 'total': 0})
+
+        # Get report details
+        details_response = intel.get_report_entities(ids=report_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get report details'}), details_response['status_code']
+
+        return jsonify({
+            'reports': details_response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', len(report_ids))
+        })
+    except Exception as e:
+        logging.error(f"Error fetching intel reports: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/intel/rules', methods=['GET'])
+@require_session
+def get_intel_rules():
+    """Get intel rules (YARA, Snort, etc.)"""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+
+        # Get query parameters
+        rule_type = request.args.get('type', 'yara-master')  # yara-master, snort-suricata-master, etc.
+        limit = request.args.get('limit', 50, type=int)
+        offset = request.args.get('offset', 0, type=int)
+
+        # Query rules
+        response = intel.query_rule_ids(
+            type=rule_type,
+            limit=limit,
+            offset=offset
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query rules', 'details': response['body']}), response['status_code']
+
+        rule_ids = response['body'].get('resources', [])
+        if not rule_ids:
+            return jsonify({'rules': [], 'total': 0})
+
+        # Get rule details
+        details_response = intel.get_rule_entities(ids=rule_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get rule details'}), details_response['status_code']
+
+        return jsonify({
+            'rules': details_response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', len(rule_ids))
+        })
+    except Exception as e:
+        logging.error(f"Error fetching intel rules: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/intel/search', methods=['GET'])
+@require_session
+def search_intel():
+    """Combined intel search across actors, indicators, and reports"""
+    try:
+        intel = Intel(auth_object=g.falcon_auth)
+        query = request.args.get('q', '')
+
+        if not query:
+            return jsonify({'error': 'Search query required'}), 400
+
+        results = {
+            'actors': [],
+            'indicators': [],
+            'reports': []
+        }
+
+        # Search actors
+        try:
+            actors_response = intel.query_actor_ids(q=query, limit=10)
+            if actors_response['status_code'] == 200:
+                actor_ids = actors_response['body'].get('resources', [])
+                if actor_ids:
+                    details = intel.get_actor_entities(ids=actor_ids)
+                    if details['status_code'] == 200:
+                        results['actors'] = details['body'].get('resources', [])
+        except Exception:
+            pass
+
+        # Search indicators
+        try:
+            indicators_response = intel.query_indicator_ids(q=query, limit=20)
+            if indicators_response['status_code'] == 200:
+                indicator_ids = indicators_response['body'].get('resources', [])
+                if indicator_ids:
+                    details = intel.get_indicator_entities(ids=indicator_ids)
+                    if details['status_code'] == 200:
+                        results['indicators'] = details['body'].get('resources', [])
+        except Exception:
+            pass
+
+        # Search reports
+        try:
+            reports_response = intel.query_report_ids(q=query, limit=10)
+            if reports_response['status_code'] == 200:
+                report_ids = reports_response['body'].get('resources', [])
+                if report_ids:
+                    details = intel.get_report_entities(ids=report_ids)
+                    if details['status_code'] == 200:
+                        results['reports'] = details['body'].get('resources', [])
+        except Exception:
+            pass
+
+        return jsonify(results)
+    except Exception as e:
+        logging.error(f"Error searching intel: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# Incidents Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/incidents', methods=['GET'])
+@require_session
+def get_incidents():
+    """Get incidents with optional filtering"""
+    try:
+        incidents = Incidents(auth_object=g.falcon_auth)
+
+        # Get query parameters
+        limit = request.args.get('limit', 100, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        status = request.args.get('status', None)
+
+        # Build filter
+        fql_filter = None
+        if status:
+            fql_filter = f"status:'{status}'"
+
+        # Query incidents
+        response = incidents.query_incidents(
+            limit=limit,
+            offset=offset,
+            filter=fql_filter,
+            sort='start.desc'
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query incidents', 'details': response['body']}), response['status_code']
+
+        incident_ids = response['body'].get('resources', [])
+        if not incident_ids:
+            return jsonify({'incidents': [], 'total': 0})
+
+        # Get incident details
+        details_response = incidents.get_incidents(ids=incident_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get incident details'}), details_response['status_code']
+
+        return jsonify({
+            'incidents': details_response['body'].get('resources', []),
+            'total': response['body'].get('meta', {}).get('pagination', {}).get('total', len(incident_ids))
+        })
+    except Exception as e:
+        logging.error(f"Error fetching incidents: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/incidents/<incident_id>', methods=['GET'])
+@require_session
+def get_incident_details(incident_id):
+    """Get single incident details"""
+    try:
+        incidents = Incidents(auth_object=g.falcon_auth)
+        response = incidents.get_incidents(ids=[incident_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get incident'}), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        if not resources:
+            return jsonify({'error': 'Incident not found'}), 404
+
+        return jsonify(resources[0])
+    except Exception as e:
+        logging.error(f"Error fetching incident {incident_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/incidents/<incident_id>/status', methods=['PATCH'])
+@require_session
+def update_incident_status(incident_id):
+    """Update incident status"""
+    try:
+        data = request.json
+        new_status = data.get('status')
+
+        if new_status not in ['new', 'in_progress', 'reopened', 'closed']:
+            return jsonify({'error': 'Invalid status. Must be: new, in_progress, reopened, or closed'}), 400
+
+        incidents = Incidents(auth_object=g.falcon_auth)
+        response = incidents.perform_incident_action(
+            action_parameters=[{'name': 'update_status', 'value': new_status}],
+            ids=[incident_id]
+        )
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to update incident status', 'details': response['body']}), response['status_code']
+
+        return jsonify({'success': True, 'status': new_status})
+    except Exception as e:
+        logging.error(f"Error updating incident {incident_id}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/incidents/behaviors', methods=['GET'])
+@require_session
+def get_incident_behaviors():
+    """Get behaviors for incidents"""
+    try:
+        incident_ids = request.args.getlist('incident_ids')
+        if not incident_ids:
+            return jsonify({'error': 'incident_ids parameter required'}), 400
+
+        incidents = Incidents(auth_object=g.falcon_auth)
+
+        # Query behaviors for the incidents
+        response = incidents.query_behaviors(filter=f"incident_id:{incident_ids}")
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query behaviors'}), response['status_code']
+
+        behavior_ids = response['body'].get('resources', [])
+        if not behavior_ids:
+            return jsonify([])
+
+        # Get behavior details
+        details_response = incidents.get_behaviors(ids=behavior_ids[:100])  # Limit to 100
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get behavior details'}), details_response['status_code']
+
+        return jsonify(details_response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error fetching behaviors: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# IOA Exclusions Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/ioa-exclusions', methods=['GET'])
+@require_session
+def get_ioa_exclusions():
+    """Get IOA exclusions"""
+    try:
+        ioa_exclusions = IOAExclusions(auth_object=g.falcon_auth)
+        response = ioa_exclusions.query_exclusions(limit=500)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query IOA exclusions', 'details': response['body']}), response['status_code']
+
+        exclusion_ids = response['body'].get('resources', [])
+        if not exclusion_ids:
+            return jsonify([])
+
+        details_response = ioa_exclusions.get_exclusions(ids=exclusion_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get IOA exclusion details'}), details_response['status_code']
+
+        return jsonify(details_response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error fetching IOA exclusions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ioa-exclusions', methods=['POST'])
+@require_session
+def create_ioa_exclusion():
+    """Create IOA exclusion"""
+    try:
+        data = request.json
+        ioa_exclusions = IOAExclusions(auth_object=g.falcon_auth)
+
+        response = ioa_exclusions.create_exclusions(body={
+            'exclusions': [{
+                'cl_regex': data.get('cl_regex', ''),
+                'description': data.get('description', ''),
+                'detection_json': data.get('detection_json', ''),
+                'groups': data.get('groups', ['all']),
+                'ifn_regex': data.get('ifn_regex', ''),
+                'name': data.get('name', ''),
+                'pattern_id': data.get('pattern_id', ''),
+                'pattern_name': data.get('pattern_name', ''),
+                'comment': data.get('comment', '')
+            }]
+        })
+
+        if response['status_code'] not in [200, 201]:
+            return jsonify({'error': 'Failed to create IOA exclusion', 'details': response['body']}), response['status_code']
+
+        return jsonify(response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error creating IOA exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ioa-exclusions/<exclusion_id>', methods=['DELETE'])
+@require_session
+def delete_ioa_exclusion(exclusion_id):
+    """Delete IOA exclusion"""
+    try:
+        ioa_exclusions = IOAExclusions(auth_object=g.falcon_auth)
+        response = ioa_exclusions.delete_exclusions(ids=[exclusion_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to delete IOA exclusion'}), response['status_code']
+
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error deleting IOA exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# ML Exclusions Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/ml-exclusions', methods=['GET'])
+@require_session
+def get_ml_exclusions():
+    """Get ML exclusions"""
+    try:
+        ml_exclusions = MLExclusions(auth_object=g.falcon_auth)
+        response = ml_exclusions.query_exclusions(limit=500)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query ML exclusions', 'details': response['body']}), response['status_code']
+
+        exclusion_ids = response['body'].get('resources', [])
+        if not exclusion_ids:
+            return jsonify([])
+
+        details_response = ml_exclusions.get_exclusions(ids=exclusion_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get ML exclusion details'}), details_response['status_code']
+
+        return jsonify(details_response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error fetching ML exclusions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ml-exclusions', methods=['POST'])
+@require_session
+def create_ml_exclusion():
+    """Create ML exclusion"""
+    try:
+        data = request.json
+        ml_exclusions = MLExclusions(auth_object=g.falcon_auth)
+
+        response = ml_exclusions.create_exclusions(body={
+            'exclusions': [{
+                'value': data.get('value', ''),
+                'excluded_from': data.get('excluded_from', ['blocking']),
+                'groups': data.get('groups', ['all']),
+                'comment': data.get('comment', '')
+            }]
+        })
+
+        if response['status_code'] not in [200, 201]:
+            return jsonify({'error': 'Failed to create ML exclusion', 'details': response['body']}), response['status_code']
+
+        return jsonify(response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error creating ML exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/ml-exclusions/<exclusion_id>', methods=['DELETE'])
+@require_session
+def delete_ml_exclusion(exclusion_id):
+    """Delete ML exclusion"""
+    try:
+        ml_exclusions = MLExclusions(auth_object=g.falcon_auth)
+        response = ml_exclusions.delete_exclusions(ids=[exclusion_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to delete ML exclusion'}), response['status_code']
+
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error deleting ML exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ----------------------------------------------------------------------
+# Sensor Visibility Exclusions Endpoints
+# ----------------------------------------------------------------------
+@app.route('/api/sv-exclusions', methods=['GET'])
+@require_session
+def get_sv_exclusions():
+    """Get Sensor Visibility exclusions"""
+    try:
+        sv_exclusions = SensorVisibilityExclusions(auth_object=g.falcon_auth)
+        response = sv_exclusions.query_exclusions(limit=500)
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to query SV exclusions', 'details': response['body']}), response['status_code']
+
+        exclusion_ids = response['body'].get('resources', [])
+        if not exclusion_ids:
+            return jsonify([])
+
+        details_response = sv_exclusions.get_exclusions(ids=exclusion_ids)
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get SV exclusion details'}), details_response['status_code']
+
+        return jsonify(details_response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error fetching SV exclusions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/sv-exclusions', methods=['POST'])
+@require_session
+def create_sv_exclusion():
+    """Create Sensor Visibility exclusion"""
+    try:
+        data = request.json
+        sv_exclusions = SensorVisibilityExclusions(auth_object=g.falcon_auth)
+
+        response = sv_exclusions.create_exclusions(body={
+            'exclusions': [{
+                'value': data.get('value', ''),
+                'groups': data.get('groups', ['all']),
+                'comment': data.get('comment', '')
+            }]
+        })
+
+        if response['status_code'] not in [200, 201]:
+            return jsonify({'error': 'Failed to create SV exclusion', 'details': response['body']}), response['status_code']
+
+        return jsonify(response['body'].get('resources', []))
+    except Exception as e:
+        logging.error(f"Error creating SV exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/sv-exclusions/<exclusion_id>', methods=['DELETE'])
+@require_session
+def delete_sv_exclusion(exclusion_id):
+    """Delete Sensor Visibility exclusion"""
+    try:
+        sv_exclusions = SensorVisibilityExclusions(auth_object=g.falcon_auth)
+        response = sv_exclusions.delete_exclusions(ids=[exclusion_id])
+
+        if response['status_code'] != 200:
+            return jsonify({'error': 'Failed to delete SV exclusion'}), response['status_code']
+
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error deleting SV exclusion: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================================================
+# FALCON SANDBOX API
+# ============================================================================
+
+@app.route('/api/sandbox/submissions', methods=['GET'])
+@require_session
+def get_sandbox_submissions():
+    """Get sandbox submissions list"""
+    try:
+        sandbox = FalconXSandbox(auth_object=g.falcon_auth)
+
+        # Get filter params
+        limit = min(int(request.args.get('limit', 100)), 500)
+        offset = int(request.args.get('offset', 0))
+        filter_str = request.args.get('filter', '')
+
+        # Query submission IDs
+        query_response = sandbox.query_submissions(
+            filter=filter_str if filter_str else None,
+            limit=limit,
+            offset=offset,
+            sort='created_timestamp|desc'
+        )
+
+        if query_response['status_code'] != 200:
+            errors = query_response['body'].get('errors', [])
+            return jsonify({'error': 'Failed to query submissions', 'details': errors}), query_response['status_code']
+
+        submission_ids = query_response['body'].get('resources', [])
+
+        if not submission_ids:
+            return jsonify({'submissions': [], 'total': 0})
+
+        # Get submission details
+        details_response = sandbox.get_submissions(ids=submission_ids)
+
+        if details_response['status_code'] != 200:
+            return jsonify({'error': 'Failed to get submission details'}), details_response['status_code']
+
+        submissions = []
+        for sub in details_response['body'].get('resources', []):
+            submissions.append({
+                'id': sub.get('id'),
+                'state': sub.get('state'),
+                'created_timestamp': sub.get('created_timestamp'),
+                'environment_id': sub.get('sandbox', [{}])[0].get('environment_id') if sub.get('sandbox') else None,
+                'sha256': sub.get('sandbox', [{}])[0].get('sha256') if sub.get('sandbox') else None,
+                'file_name': sub.get('sandbox', [{}])[0].get('file_name') if sub.get('sandbox') else None,
+                'file_type': sub.get('sandbox', [{}])[0].get('file_type') if sub.get('sandbox') else None,
+                'verdict': sub.get('sandbox', [{}])[0].get('verdict') if sub.get('sandbox') else None,
+                'url': sub.get('sandbox', [{}])[0].get('url') if sub.get('sandbox') else None,
+            })
+
+        return jsonify({
+            'submissions': submissions,
+            'total': len(submissions)
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching sandbox submissions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sandbox/submit', methods=['POST'])
+@require_session
+def submit_to_sandbox():
+    """Submit file hash or URL for sandbox analysis"""
+    try:
+        sandbox = FalconXSandbox(auth_object=g.falcon_auth)
+        data = request.json or {}
+
+        # Build submission body
+        submit_body = {
+            'environment_id': data.get('environment_id', 160),  # Default: Windows 10 64-bit
+            'network_settings': data.get('network_settings', 'default'),
+        }
+
+        # Either sha256 or url, not both
+        if data.get('sha256'):
+            submit_body['sha256'] = data['sha256']
+        elif data.get('url'):
+            submit_body['url'] = data['url']
+        else:
+            return jsonify({'error': 'Must provide sha256 or url'}), 400
+
+        # Optional params
+        if data.get('command_line'):
+            submit_body['command_line'] = data['command_line']
+        if data.get('document_password'):
+            submit_body['document_password'] = data['document_password']
+        if data.get('submit_name'):
+            submit_body['submit_name'] = data['submit_name']
+        if data.get('action_script'):
+            submit_body['action_script'] = data['action_script']
+
+        response = sandbox.submit(body=submit_body)
+
+        if response['status_code'] not in [200, 201]:
+            errors = response['body'].get('errors', [])
+            return jsonify({'error': 'Submission failed', 'details': errors}), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        submission = resources[0] if resources else {}
+
+        return jsonify({
+            'success': True,
+            'submission_id': submission.get('id'),
+            'state': submission.get('state'),
+            'created_timestamp': submission.get('created_timestamp')
+        })
+
+    except Exception as e:
+        logger.error(f"Error submitting to sandbox: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sandbox/reports/<submission_id>', methods=['GET'])
+@require_session
+def get_sandbox_report(submission_id):
+    """Get full sandbox analysis report"""
+    try:
+        sandbox = FalconXSandbox(auth_object=g.falcon_auth)
+
+        response = sandbox.get_reports(ids=[submission_id])
+
+        if response['status_code'] != 200:
+            errors = response['body'].get('errors', [])
+            return jsonify({'error': 'Failed to get report', 'details': errors}), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        if not resources:
+            return jsonify({'error': 'Report not found'}), 404
+
+        report = resources[0]
+
+        return jsonify({
+            'report': {
+                'id': report.get('id'),
+                'verdict': report.get('verdict'),
+                'created_timestamp': report.get('created_timestamp'),
+                'environment_description': report.get('environment_description'),
+                'threat_score': report.get('threat_score'),
+                'iocs': report.get('ioc_report_broad_csv_artifact_id') or report.get('ioc_report_strict_csv_artifact_id'),
+                'processes': report.get('processes', []),
+                'signatures': report.get('signatures', []),
+                'dns_requests': report.get('dns_requests', []),
+                'contacted_hosts': report.get('contacted_hosts', []),
+                'http_requests': report.get('http_requests', []),
+                'extracted_files': report.get('extracted_files', []),
+                'extracted_interesting_strings': report.get('extracted_interesting_strings', []),
+                'mitre_attacks': report.get('mitre_attacks', []),
+                'file_metadata': report.get('file_metadata'),
+                'file_type': report.get('file_type'),
+                'sha256': report.get('sha256'),
+                'submit_name': report.get('submit_name'),
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching sandbox report: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sandbox/summary/<submission_id>', methods=['GET'])
+@require_session
+def get_sandbox_summary(submission_id):
+    """Get summary sandbox report"""
+    try:
+        sandbox = FalconXSandbox(auth_object=g.falcon_auth)
+
+        response = sandbox.get_summary_reports(ids=[submission_id])
+
+        if response['status_code'] != 200:
+            errors = response['body'].get('errors', [])
+            return jsonify({'error': 'Failed to get summary', 'details': errors}), response['status_code']
+
+        resources = response['body'].get('resources', [])
+        if not resources:
+            return jsonify({'error': 'Summary not found'}), 404
+
+        summary = resources[0]
+
+        return jsonify({
+            'summary': {
+                'id': summary.get('id'),
+                'verdict': summary.get('verdict'),
+                'threat_score': summary.get('threat_score'),
+                'environment_description': summary.get('environment_description'),
+                'sha256': summary.get('sha256'),
+                'file_type': summary.get('file_type'),
+                'submit_name': summary.get('submit_name'),
+                'created_timestamp': summary.get('created_timestamp'),
+                'tags': summary.get('tags', []),
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error fetching sandbox summary: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/')
 def index():

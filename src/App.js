@@ -3,7 +3,7 @@ import {
   AlertTriangle, Shield, Activity, Server, Search, RefreshCw,
   AlertCircle, Download, Plus, Play, Trash2, HelpCircle, X, Book, LogOut, Moon, Sun,
   Clock, TrendingUp, CheckSquare, Zap, BookOpen, Terminal, Database, Hash, Globe,
-  List, CheckCircle, Lightbulb, ExternalLink, Command, Copy, Check
+  List, CheckCircle, Lightbulb, ExternalLink, Command, Copy, Check, FileText, HeartPulse
 } from 'lucide-react';
 
 // Import MITRE ATT&CK utilities
@@ -59,6 +59,10 @@ const FalconDashboard = () => {
   const [hosts, setHosts] = useState([]);
   const [iocs, setIOCs] = useState([]);
   const [playbooks, setPlaybooks] = useState([]);
+  const [sandboxSubmissions, setSandboxSubmissions] = useState([]);
+  const [showSandboxDialog, setShowSandboxDialog] = useState(false);
+  const [selectedSandboxReport, setSelectedSandboxReport] = useState(null);
+  const [showSandboxReportDialog, setShowSandboxReportDialog] = useState(false);
   const [dashboardStats, setDashboardStats] = useState(null);
   const [nonHashDetections, setNonHashDetections] = useState(0);
   const [timeRange, setTimeRange] = useState('24');
@@ -88,7 +92,20 @@ const FalconDashboard = () => {
   const [showSystemDropdown, setShowSystemDropdown] = useState(false);
   const [autoTriggerStatus, setAutoTriggerStatus] = useState(null);
   const [platformFilter, setPlatformFilter] = useState('all');
+  const [sourceFilter, setSourceFilter] = useState('all');
   const [isRefreshing, setIsRefreshing] = useState(false);
+
+  // Detection-Actor Correlation State
+  const [detectionActors, setDetectionActors] = useState({}); // {detectionId: [actors...]}
+  const [detectionIndicators, setDetectionIndicators] = useState({}); // {detectionId: [indicators...]}
+  const [actorLoading, setActorLoading] = useState({}); // {detectionId: boolean}
+  const [refreshingDetection, setRefreshingDetection] = useState({}); // {detectionId: boolean}
+  const [showActorDetailDialog, setShowActorDetailDialog] = useState(false);
+  const [selectedActorDetail, setSelectedActorDetail] = useState(null);
+  const [bulkActorLoading, setBulkActorLoading] = useState(false);
+  const [bulkActorProgress, setBulkActorProgress] = useState({ current: 0, total: 0 });
+  const [showBulkActorResults, setShowBulkActorResults] = useState(false);
+  const [bulkActorResults, setBulkActorResults] = useState(null);
 
   const showNotification = useCallback((message, type = 'success') => {
     setNotification({ message, type });
@@ -244,6 +261,232 @@ const FalconDashboard = () => {
       console.error('Error fetching playbooks:', error);
     }
   }, [handleApiError]);
+
+  const fetchSandboxSubmissions = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/sandbox/submissions`, { headers: getAuthHeaders() });
+      if (handleApiError(response)) return;
+      const data = await response.json();
+      if (data.submissions) setSandboxSubmissions(data.submissions);
+    } catch (error) {
+      console.error('Error fetching sandbox submissions:', error);
+    }
+  }, [handleApiError]);
+
+  const handleSubmitToSandbox = async (submitData) => {
+    try {
+      const response = await fetch(`${API_BASE}/sandbox/submit`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(submitData)
+      });
+      if (handleApiError(response)) return;
+      const data = await response.json();
+      if (data.success) {
+        showNotification('Submitted to sandbox successfully');
+        setShowSandboxDialog(false);
+        fetchSandboxSubmissions();
+      } else {
+        showNotification(data.error || 'Submission failed', 'error');
+      }
+    } catch (error) {
+      console.error('Error submitting to sandbox:', error);
+      showNotification('Error submitting to sandbox', 'error');
+    }
+  };
+
+  const handleViewSandboxReport = async (submissionId) => {
+    try {
+      const response = await fetch(`${API_BASE}/sandbox/reports/${submissionId}`, { headers: getAuthHeaders() });
+      if (handleApiError(response)) return;
+      const data = await response.json();
+      if (data.report) {
+        setSelectedSandboxReport(data.report);
+        setShowSandboxReportDialog(true);
+      } else {
+        showNotification('Report not available yet', 'error');
+      }
+    } catch (error) {
+      console.error('Error fetching sandbox report:', error);
+      showNotification('Error fetching report', 'error');
+    }
+  };
+
+  // ============================================================================
+  // DETECTION-ACTOR CORRELATION HANDLERS
+  // ============================================================================
+
+  // Refresh single detection from CrowdStrike API
+  const handleRefreshDetection = async (detectionId) => {
+    setRefreshingDetection(prev => ({ ...prev, [detectionId]: true }));
+    try {
+      const response = await fetch(`${API_BASE}/detections/${detectionId}/refresh`, {
+        method: 'POST',
+        headers: getAuthHeaders()
+      });
+      if (!response.ok) throw new Error('Failed to refresh detection');
+      const result = await response.json();
+
+      // Update the detection in local state
+      setDetections(prev => prev.map(d =>
+        (d.id === detectionId || d.detection_id === detectionId) ? { ...d, ...result.detection } : d
+      ));
+
+      showNotification(`Detection refreshed at ${new Date(result.refreshed_at).toLocaleTimeString()}`);
+
+      // Also refresh actor correlations
+      handleFetchDetectionActors(detectionId, true);
+    } catch (error) {
+      showNotification(`Failed to refresh: ${error.message}`, 'error');
+    } finally {
+      setRefreshingDetection(prev => ({ ...prev, [detectionId]: false }));
+    }
+  };
+
+  // Fetch actors associated with a detection
+  const handleFetchDetectionActors = async (detectionId, forceRefresh = false) => {
+    setActorLoading(prev => ({ ...prev, [detectionId]: true }));
+    try {
+      const params = forceRefresh ? '?refresh=true' : '';
+      const response = await fetch(
+        `${API_BASE}/detections/${detectionId}/actors${params}`,
+        { headers: getAuthHeaders() }
+      );
+      if (!response.ok) throw new Error('Failed to fetch actors');
+      const result = await response.json();
+      setDetectionActors(prev => ({
+        ...prev,
+        [detectionId]: result.actors
+      }));
+      setDetectionIndicators(prev => ({
+        ...prev,
+        [detectionId]: result.indicators || []
+      }));
+      // Show notification with results
+      const actorCount = result.actors?.length || 0;
+      const indicatorCount = result.indicators?.length || 0;
+      if (actorCount > 0 || indicatorCount > 0) {
+        showNotification(`Found ${actorCount} actor(s) and ${indicatorCount} indicator(s)`);
+      } else {
+        showNotification('No threat intel linked to this detection', 'info');
+      }
+    } catch (error) {
+      console.error(`Failed to fetch actors for ${detectionId}:`, error);
+      showNotification(`Failed to fetch intel: ${error.message}`, 'error');
+    } finally {
+      setActorLoading(prev => ({ ...prev, [detectionId]: false }));
+    }
+  };
+
+  // View actor detail
+  const handleViewActorDetail = async (actorId) => {
+    try {
+      const response = await fetch(`${API_BASE}/intel/actors/${actorId}`, {
+        headers: getAuthHeaders()
+      });
+      if (!response.ok) throw new Error('Failed to fetch actor');
+      const result = await response.json();
+      setSelectedActorDetail(result.actor);
+      setShowActorDetailDialog(true);
+    } catch (error) {
+      showNotification(`Failed to load actor details: ${error.message}`, 'error');
+    }
+  };
+
+  // Bulk correlation - find actors for multiple detections
+  const handleBulkFindActors = async (detectionIds) => {
+    if (!detectionIds || detectionIds.length === 0) {
+      showNotification('No detections selected', 'error');
+      return;
+    }
+
+    setBulkActorLoading(true);
+    setBulkActorProgress({ current: 0, total: detectionIds.length });
+
+    const results = {
+      total: detectionIds.length,
+      processed: 0,
+      withActors: [],
+      withIndicators: [],
+      withoutActors: [],  // Detections with no actors AND no indicators
+      errors: [],
+      scanTime: new Date().toISOString()
+    };
+
+    try {
+      // Process in batches of 10 to avoid overwhelming the API
+      const batchSize = 10;
+      for (let i = 0; i < detectionIds.length; i += batchSize) {
+        const batch = detectionIds.slice(i, i + batchSize);
+
+        // Process batch in parallel
+        const promises = batch.map(async (detectionId) => {
+          try {
+            const response = await fetch(
+              `${API_BASE}/detections/${detectionId}/actors?refresh=true`,
+              { headers: getAuthHeaders() }
+            );
+            if (!response.ok) throw new Error('API error');
+            const data = await response.json();
+
+            // Update local state
+            setDetectionActors(prev => ({
+              ...prev,
+              [detectionId]: data.actors
+            }));
+            setDetectionIndicators(prev => ({
+              ...prev,
+              [detectionId]: data.indicators || []
+            }));
+
+            return {
+              detectionId,
+              actors: data.actors || [],
+              indicators: data.indicators || [],
+              error: null
+            };
+          } catch (error) {
+            return { detectionId, actors: [], indicators: [], error: error.message };
+          }
+        });
+
+        const batchResults = await Promise.all(promises);
+
+        batchResults.forEach(result => {
+          results.processed++;
+          if (result.error) {
+            results.errors.push(result);
+          } else {
+            // Track actors and indicators separately (a detection can have both)
+            if (result.actors.length > 0) {
+              results.withActors.push(result);
+            }
+            if (result.indicators.length > 0) {
+              results.withIndicators.push(result);
+            }
+            if (result.actors.length === 0 && result.indicators.length === 0) {
+              results.withoutActors.push(result);
+            }
+          }
+        });
+
+        // Update progress
+        setBulkActorProgress({ current: results.processed, total: detectionIds.length });
+
+        // Small delay between batches to avoid rate limiting
+        if (i + batchSize < detectionIds.length) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      setBulkActorResults(results);
+      setShowBulkActorResults(true);
+    } catch (error) {
+      showNotification(`Bulk correlation failed: ${error.message}`, 'error');
+    } finally {
+      setBulkActorLoading(false);
+    }
+  };
 
   const calculateDashboardStats = (detections, hours) => {
     const now = new Date();
@@ -1282,7 +1525,7 @@ const FalconDashboard = () => {
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow-2xl p-8 max-w-md w-full">
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center">
-              <Shield className="w-12 h-12 text-red-600 mr-3" />
+              <img src="/logo.png" alt="Falcon Manager Pro" className="w-16 h-16 mr-3" />
               <h1 className="text-3xl font-bold text-gray-800 dark:text-white">Falcon Manager Pro</h1>
             </div>
             <button
@@ -1361,7 +1604,7 @@ const FalconDashboard = () => {
         <div className="px-6 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-4">
-              <Shield className="w-8 h-8 text-red-600" />
+              <img src="/logo.png" alt="Falcon Manager Pro" className="w-14 h-14" />
               <div>
                 <h1 className="text-2xl font-bold text-gray-800 dark:text-white">Falcon Manager Pro</h1>
                 {tenantInfo && (
@@ -1605,13 +1848,19 @@ const FalconDashboard = () => {
         {/* TABS */}
         <div className="bg-white dark:bg-gray-800 rounded-lg shadow mb-6">
           <div className="border-b border-gray-200 dark:border-gray-700">
-            <nav className="flex space-x-8 px-6">
+            <nav className="flex space-x-8 px-6" style={{overflowX: 'auto', scrollbarWidth: 'thin'}}>
               {[
                 { id: 'dashboard', name: 'Dashboard', icon: Activity },
                 { id: 'detections', name: 'Detections', icon: AlertTriangle },
                 { id: 'hosts', name: 'Hosts', icon: Server },
+                { id: 'sensor-health', name: 'Sensor Health', icon: HeartPulse },
+                { id: 'incidents', name: 'Incidents', icon: Zap },
                 { id: 'iocs', name: 'IOC Management', icon: AlertCircle },
+                { id: 'exclusions', name: 'Exclusions', icon: Database },
+                { id: 'policies', name: 'Policies', icon: Shield },
+                { id: 'intel', name: 'Intel', icon: Globe },
                 { id: 'playbooks', name: 'Playbooks', icon: Play },
+                { id: 'sandbox', name: 'Sandbox', icon: Terminal },
               ].map((tab) => (
                 <button
                   key={tab.id}
@@ -1638,23 +1887,35 @@ const FalconDashboard = () => {
           )}
 
           {activeTab === 'detections' && (
-            <DetectionsTab 
+            <DetectionsTab
               detections={detections}
               searchQuery={searchQuery}
               setSearchQuery={setSearchQuery}
               selectedSeverity={selectedSeverity}
               setSelectedSeverity={setSelectedSeverity}
+              sourceFilter={sourceFilter}
+              setSourceFilter={setSourceFilter}
               selectedDetections={selectedDetections}
               setSelectedDetections={setSelectedDetections}
               handleBulkUpdate={handleBulkUpdate}
               toggleDetectionSelection={toggleDetectionSelection}
               getSeverityColor={getSeverityColor}
               openCommentDialog={openCommentDialog}
+              detectionActors={detectionActors}
+              detectionIndicators={detectionIndicators}
+              actorLoading={actorLoading}
+              refreshingDetection={refreshingDetection}
+              handleRefreshDetection={handleRefreshDetection}
+              handleFetchDetectionActors={handleFetchDetectionActors}
+              handleViewActorDetail={handleViewActorDetail}
+              bulkActorLoading={bulkActorLoading}
+              handleBulkFindActors={handleBulkFindActors}
+              bulkActorProgress={bulkActorProgress}
             />
           )}
 
           {activeTab === 'hosts' && (
-            <HostsTab 
+            <HostsTab
               hosts={hosts}
               handleContainHost={handleContainHost}
               handleLiftContainment={handleLiftContainment}
@@ -1683,6 +1944,22 @@ const FalconDashboard = () => {
             />
           )}
 
+          {activeTab === 'sensor-health' && (
+            <SensorHealthTab showNotification={showNotification} />
+          )}
+
+          {activeTab === 'incidents' && (
+            <IncidentsTab showNotification={showNotification} />
+          )}
+
+          {activeTab === 'policies' && (
+            <PoliciesTab showNotification={showNotification} />
+          )}
+
+          {activeTab === 'intel' && (
+            <IntelTab showNotification={showNotification} />
+          )}
+
           {activeTab === 'iocs' && (
             <IOCsTab 
               iocs={iocs}
@@ -1697,7 +1974,7 @@ const FalconDashboard = () => {
           )}
 
           {activeTab === 'playbooks' && (
-            <PlaybooksTab 
+            <PlaybooksTab
               playbooks={playbooks}
               setShowPlaybookDialog={setShowPlaybookDialog}
               onExecuteClick={openExecuteDialog}
@@ -1709,19 +1986,56 @@ const FalconDashboard = () => {
               toggleAutoTrigger={toggleAutoTrigger}
             />
           )}
+
+          {activeTab === 'sandbox' && (
+            <SandboxTab
+              submissions={sandboxSubmissions}
+              onRefresh={fetchSandboxSubmissions}
+              onSubmitClick={() => setShowSandboxDialog(true)}
+              onViewReport={handleViewSandboxReport}
+              showNotification={showNotification}
+            />
+          )}
+
+          {activeTab === 'exclusions' && (
+            <ExclusionsTab showNotification={showNotification} />
+          )}
         </div>
       </div>
 
       {/* DIALOGS */}
       {showCommentDialog && (
-        <CommentDialog 
-          commentData={commentData} 
-          setCommentData={setCommentData} 
-          onConfirm={handleDetectionAction} 
-          onClose={() => setShowCommentDialog(false)} 
+        <CommentDialog
+          commentData={commentData}
+          setCommentData={setCommentData}
+          onConfirm={handleDetectionAction}
+          onClose={() => setShowCommentDialog(false)}
         />
       )}
-      
+
+      {showActorDetailDialog && selectedActorDetail && (
+        <ActorDetailDialog
+          actor={selectedActorDetail}
+          onClose={() => {
+            setShowActorDetailDialog(false);
+            setSelectedActorDetail(null);
+          }}
+          onNavigateToIntel={() => setActiveTab('intel')}
+        />
+      )}
+
+      {showBulkActorResults && bulkActorResults && (
+        <BulkActorResultsDialog
+          results={bulkActorResults}
+          onClose={() => {
+            setShowBulkActorResults(false);
+            setBulkActorResults(null);
+          }}
+          onViewActor={handleViewActorDetail}
+          detectionActors={detectionActors}
+        />
+      )}
+
       {showIOCDialog && (
         <IOCDialog 
           onClose={() => setShowIOCDialog(false)} 
@@ -1813,6 +2127,23 @@ const FalconDashboard = () => {
           title={rtrOutput.title}
           data={rtrOutput.data}
           onClose={() => setShowRTROutputDialog(false)}
+        />
+      )}
+
+      {showSandboxDialog && (
+        <SandboxSubmitDialog
+          onClose={() => setShowSandboxDialog(false)}
+          onSubmit={handleSubmitToSandbox}
+        />
+      )}
+
+      {showSandboxReportDialog && selectedSandboxReport && (
+        <SandboxReportDialog
+          report={selectedSandboxReport}
+          onClose={() => {
+            setShowSandboxReportDialog(false);
+            setSelectedSandboxReport(null);
+          }}
         />
       )}
 
@@ -2112,15 +2443,23 @@ const DashboardTab = ({ dashboardStats, timeRange, setTimeRange, detections }) =
   );
 };
 
-const DetectionsTab = ({ 
-  detections, searchQuery, setSearchQuery, selectedSeverity, setSelectedSeverity, 
-  selectedDetections, setSelectedDetections, handleBulkUpdate, toggleDetectionSelection, 
-  getSeverityColor, openCommentDialog 
+const DetectionsTab = ({
+  detections, searchQuery, setSearchQuery, selectedSeverity, setSelectedSeverity,
+  sourceFilter, setSourceFilter,
+  selectedDetections, setSelectedDetections, handleBulkUpdate, toggleDetectionSelection,
+  getSeverityColor, openCommentDialog,
+  detectionActors, detectionIndicators, actorLoading, refreshingDetection,
+  handleRefreshDetection, handleFetchDetectionActors, handleViewActorDetail,
+  bulkActorLoading, handleBulkFindActors, bulkActorProgress
 }) => {
   const filteredDetections = detections
     .filter(d => {
       if (selectedSeverity === 'all') return true;
       return (d.severity || '').toLowerCase() === selectedSeverity.toLowerCase();
+    })
+    .filter(d => {
+      if (sourceFilter === 'all') return true;
+      return (d.source || '').toLowerCase() === sourceFilter.toLowerCase();
     })
     .filter((d) => (d.name || '').toLowerCase().includes(searchQuery.toLowerCase()));
 
@@ -2148,23 +2487,81 @@ const DetectionsTab = ({
             <option value="informational">Informational</option>
             <option value="unknown">Unknown</option>
           </select>
+          <select
+            value={sourceFilter}
+            onChange={(e) => setSourceFilter(e.target.value)}
+            className="px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+          >
+            <option value="all">All Sources</option>
+            <option value="panther">Panther</option>
+            <option value="google_secops">Google SecOps</option>
+            <option value="splunk">Splunk</option>
+            <option value="sentinel">Sentinel</option>
+            <option value="elastic">Elastic</option>
+            <option value="sumo_logic">Sumo Logic</option>
+            <option value="crowdstrike">CrowdStrike Falcon</option>
+            <option value="sentinelone">SentinelOne</option>
+            <option value="microsoft_defender">Microsoft Defender</option>
+            <option value="unifi">UniFi</option>
+          </select>
         </div>
-        {selectedDetections.length > 0 && (
-          <div className="flex space-x-2 ml-4">
-            <button 
-              onClick={() => handleBulkUpdate('true_positive')} 
-              className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+        <div className="flex space-x-2 ml-4 items-center">
+          {/* Scan All Detections Button with Info Tooltip */}
+          <div className="relative group">
+            <button
+              onClick={() => handleBulkFindActors(filteredDetections.map(d => d.id))}
+              disabled={bulkActorLoading}
+              className="px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50 flex items-center"
             >
-              Bulk Resolve ({selectedDetections.length})
-            </button>
-            <button 
-              onClick={() => handleBulkUpdate('false_positive')} 
-              className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
-            >
-              Bulk Close ({selectedDetections.length})
+              {bulkActorLoading ? (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+                  {bulkActorProgress.current}/{bulkActorProgress.total}
+                </>
+              ) : (
+                <>
+                  <Search className="w-4 h-4 mr-2" />
+                  Scan All ({filteredDetections.length})
+                </>
+              )}
             </button>
           </div>
-        )}
+          {/* Info icon with tooltip */}
+          <div className="relative group">
+            <HelpCircle className="w-5 h-5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 cursor-help" />
+            <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 pointer-events-none">
+              <div className="font-semibold mb-1">Detection Counts</div>
+              <div><span className="text-green-400">Active:</span> {filteredDetections.filter(d => ['new', 'in_progress'].includes(d.status)).length} (new + in progress)</div>
+              <div><span className="text-blue-400">Total:</span> {filteredDetections.length} (includes closed/resolved)</div>
+              <div className="absolute top-full left-1/2 transform -translate-x-1/2 border-4 border-transparent border-t-gray-900"></div>
+            </div>
+          </div>
+
+          {selectedDetections.length > 0 && (
+            <>
+              <button
+                onClick={() => handleBulkFindActors(selectedDetections)}
+                disabled={bulkActorLoading}
+                className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 flex items-center"
+              >
+                <Globe className="w-4 h-4 mr-2" />
+                Find Actors ({selectedDetections.length})
+              </button>
+              <button
+                onClick={() => handleBulkUpdate('true_positive')}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+              >
+                Bulk Resolve ({selectedDetections.length})
+              </button>
+              <button
+                onClick={() => handleBulkUpdate('false_positive')}
+                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+              >
+                Bulk Close ({selectedDetections.length})
+              </button>
+            </>
+          )}
+        </div>
       </div>
       
       <div className="flex items-center mb-3 pb-2 border-b dark:border-gray-700">
@@ -2188,6 +2585,10 @@ const DetectionsTab = ({
      <div className="space-y-4">
   {filteredDetections.map((detection) => {
     const { tactics, techniques } = mapToMitreAttack(detection);
+    const actors = detectionActors[detection.id] || [];
+    const indicators = detectionIndicators[detection.id] || [];
+    const isLoadingActors = actorLoading[detection.id];
+    const isRefreshing = refreshingDetection[detection.id];
 
     return (
       <div
@@ -2235,6 +2636,89 @@ const DetectionsTab = ({
               </div>
             )}
 
+            {/* Linked Threat Actors Section */}
+            <div className="mb-3 p-3 bg-gray-50 dark:bg-gray-900 rounded-lg">
+              <div className="flex items-center justify-between mb-2">
+                <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center">
+                  <Globe className="w-4 h-4 mr-1" />
+                  Linked Threat Actors
+                </h4>
+                <button
+                  onClick={() => handleFetchDetectionActors(detection.id, true)}
+                  disabled={isLoadingActors}
+                  className="text-xs text-blue-600 hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300 flex items-center"
+                >
+                  <RefreshCw className={`w-3 h-3 mr-1 ${isLoadingActors ? 'animate-spin' : ''}`} />
+                  {isLoadingActors ? 'Loading...' : 'Find Actors'}
+                </button>
+              </div>
+
+              {actors.length > 0 ? (
+                <div className="flex flex-wrap gap-2">
+                  {actors.slice(0, 5).map((actor) => (
+                    <button
+                      key={actor.actor_id}
+                      onClick={() => handleViewActorDetail(actor.actor_id)}
+                      className={`inline-flex items-center px-2 py-1 rounded text-xs font-medium transition-colors
+                        ${actor.correlation_type === 'native'
+                          ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 border border-red-300 dark:border-red-700'
+                          : actor.correlation_type === 'indicator_match'
+                          ? 'bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200'
+                          : 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200'
+                        } hover:opacity-80 cursor-pointer`}
+                      title={`${actor.correlation_type} (${Math.round(actor.confidence_score * 100)}% confidence)`}
+                    >
+                      <AlertTriangle className="w-3 h-3 mr-1" />
+                      {actor.actor_name}
+                      <span className="ml-1 opacity-60">
+                        {Math.round(actor.confidence_score * 100)}%
+                      </span>
+                    </button>
+                  ))}
+                  {actors.length > 5 && (
+                    <span className="text-xs text-gray-500 dark:text-gray-400 self-center">
+                      +{actors.length - 5} more
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <p className="text-xs text-gray-500 dark:text-gray-400">
+                  {isLoadingActors ? 'Searching for linked actors...' : 'Click "Find Actors" to search for threat actor attribution'}
+                </p>
+              )}
+            </div>
+
+            {/* Linked Indicators (IOCs) Section */}
+            {indicators.length > 0 && (
+              <div className="mb-3 p-3 bg-purple-50 dark:bg-purple-900/30 rounded-lg">
+                <h4 className="text-sm font-medium text-purple-700 dark:text-purple-300 mb-2 flex items-center">
+                  <Shield className="w-4 h-4 mr-1" />
+                  Intel Indicators ({indicators.length})
+                </h4>
+                <div className="flex flex-wrap gap-2">
+                  {indicators.slice(0, 6).map((ind, idx) => (
+                    <div
+                      key={idx}
+                      className="inline-flex flex-col px-2 py-1 rounded text-xs bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 border border-purple-300 dark:border-purple-700"
+                      title={`${ind.indicator_type}: ${ind.indicator_value}\n${ind.description || ''}`}
+                    >
+                      <span className="font-medium truncate max-w-[150px]">
+                        {ind.malware_families?.length > 0 ? ind.malware_families[0] : ind.indicator_type}
+                      </span>
+                      <span className="opacity-70 text-[10px]">
+                        {ind.threat_types?.[0] || ind.indicator_type} • {ind.confidence}%
+                      </span>
+                    </div>
+                  ))}
+                  {indicators.length > 6 && (
+                    <span className="text-xs text-purple-500 dark:text-purple-400 self-center">
+                      +{indicators.length - 6} more
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center space-x-4 text-sm text-gray-600 dark:text-gray-400">
               <span>
                 Host:{' '}
@@ -2246,7 +2730,15 @@ const DetectionsTab = ({
               </span>
             </div>
           </div>
-          <div className="flex space-x-2">
+          <div className="flex flex-col space-y-2 ml-4">
+            <button
+              onClick={() => handleRefreshDetection(detection.id)}
+              disabled={isRefreshing}
+              className="p-2 text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400 rounded-lg hover:bg-blue-50 dark:hover:bg-gray-700 transition-colors"
+              title="Refresh detection from CrowdStrike"
+            >
+              <RefreshCw className={`w-5 h-5 ${isRefreshing ? 'animate-spin' : ''}`} />
+            </button>
             <button
               onClick={() => openCommentDialog(detection.id, 'resolve')}
               className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
@@ -2516,7 +3008,7 @@ const IOCsTab = ({
                   {ioc.tags && ioc.tags.length > 0 && (
                     <div className="flex flex-wrap gap-1 mt-2">
                       {ioc.tags.map((tag, idx) => (
-                        <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded text-xs">{tag}</span>
+                        <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded text-xs">{typeof tag === 'object' ? (tag.value || tag.slug || tag.name) : tag}</span>
                       ))}
                     </div>
                   )}
@@ -2752,6 +3244,2017 @@ const PlaybooksTab = ({
           ))}
         </div>
       )}
+    </div>
+  );
+};
+
+// Sandbox Tab Component
+const SandboxTab = ({ submissions, onRefresh, onSubmitClick, onViewReport, showNotification }) => {
+  const [searchQuery, setSearchQuery] = useState('');
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  useEffect(() => {
+    onRefresh();
+  }, [onRefresh]);
+
+  const handleRefresh = async () => {
+    setIsRefreshing(true);
+    await onRefresh();
+    setIsRefreshing(false);
+  };
+
+  const filteredSubmissions = submissions.filter(sub => {
+    const searchLower = searchQuery.toLowerCase();
+    return (
+      (sub.file_name || '').toLowerCase().includes(searchLower) ||
+      (sub.sha256 || '').toLowerCase().includes(searchLower) ||
+      (sub.url || '').toLowerCase().includes(searchLower)
+    );
+  });
+
+  const getVerdictColor = (verdict) => {
+    switch (verdict?.toLowerCase()) {
+      case 'malicious': return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200';
+      case 'suspicious': return 'bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200';
+      case 'no specific threat': return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200';
+      default: return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200';
+    }
+  };
+
+  const getStateColor = (state) => {
+    switch (state?.toLowerCase()) {
+      case 'success': return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200';
+      case 'running': return 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200';
+      case 'error': return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200';
+      default: return 'bg-yellow-100 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200';
+    }
+  };
+
+  const getEnvironmentName = (envId) => {
+    const envMap = {
+      100: 'Windows 7 32-bit',
+      110: 'Windows 7 64-bit',
+      160: 'Windows 10 64-bit',
+      200: 'Android',
+      300: 'Linux Ubuntu 16.04 64-bit',
+    };
+    return envMap[envId] || `Environment ${envId}`;
+  };
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-4">
+        <div>
+          <h2 className="text-xl font-bold text-gray-800 dark:text-white">Falcon Sandbox</h2>
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            Submit files and URLs for malware analysis
+          </p>
+        </div>
+        <div className="flex space-x-2">
+          <button
+            onClick={handleRefresh}
+            disabled={isRefreshing}
+            className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            <RefreshCw className={`w-4 h-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
+            {isRefreshing ? 'Refreshing...' : 'Refresh'}
+          </button>
+          <button
+            onClick={onSubmitClick}
+            className="flex items-center px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+          >
+            <Plus className="w-4 h-4 mr-2" />
+            Submit Sample
+          </button>
+        </div>
+      </div>
+
+      {/* Search */}
+      <div className="mb-4">
+        <input
+          type="text"
+          placeholder="Search by filename, SHA256, or URL..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+        />
+      </div>
+
+      {/* Results count */}
+      {submissions.length > 0 && (
+        <div className="bg-purple-50 dark:bg-purple-900 border border-purple-200 dark:border-purple-700 rounded-lg p-3 mb-4">
+          <span className="text-sm text-purple-800 dark:text-purple-200">
+            Showing {filteredSubmissions.length} of {submissions.length} submissions
+          </span>
+        </div>
+      )}
+
+      {/* Empty State */}
+      {filteredSubmissions.length === 0 ? (
+        <div className="text-center py-12 bg-gray-50 dark:bg-gray-900 rounded-lg">
+          <Terminal className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <p className="text-gray-600 dark:text-gray-400">No sandbox submissions found</p>
+          <button
+            onClick={onSubmitClick}
+            className="mt-4 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+          >
+            Submit your first sample
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {filteredSubmissions.map((sub) => (
+            <div key={sub.id} className="border dark:border-gray-700 rounded-lg p-4 hover:shadow-md transition-shadow bg-white dark:bg-gray-800">
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  {/* Status badges */}
+                  <div className="flex items-center space-x-2 mb-2">
+                    <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getStateColor(sub.state)}`}>
+                      {sub.state || 'pending'}
+                    </span>
+                    {sub.verdict && (
+                      <span className={`px-3 py-1 rounded-full text-xs font-semibold ${getVerdictColor(sub.verdict)}`}>
+                        {sub.verdict}
+                      </span>
+                    )}
+                    {sub.environment_id && (
+                      <span className="px-3 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 rounded-full text-xs">
+                        {getEnvironmentName(sub.environment_id)}
+                      </span>
+                    )}
+                  </div>
+
+                  {/* File/URL info */}
+                  {sub.file_name && (
+                    <h3 className="font-semibold text-lg text-gray-800 dark:text-white mb-1">
+                      {sub.file_name}
+                    </h3>
+                  )}
+                  {sub.url && (
+                    <p className="text-sm text-blue-600 dark:text-blue-400 mb-1 break-all">
+                      URL: {sub.url}
+                    </p>
+                  )}
+                  {sub.sha256 && (
+                    <p className="font-mono text-xs text-gray-500 dark:text-gray-400 break-all">
+                      SHA256: {sub.sha256}
+                    </p>
+                  )}
+                  {sub.file_type && (
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                      Type: {sub.file_type}
+                    </p>
+                  )}
+                  {sub.created_timestamp && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                      Submitted: {new Date(sub.created_timestamp).toLocaleString()}
+                    </p>
+                  )}
+                </div>
+
+                {/* Actions */}
+                <div className="ml-4 flex flex-col space-y-2">
+                  {sub.state === 'success' && (
+                    <button
+                      onClick={() => onViewReport(sub.id)}
+                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm flex items-center"
+                    >
+                      <FileText className="w-4 h-4 mr-1" />
+                      View Report
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(sub.id);
+                      showNotification('Submission ID copied');
+                    }}
+                    className="px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-sm flex items-center"
+                  >
+                    <Copy className="w-4 h-4 mr-1" />
+                    Copy ID
+                  </button>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Exclusions Tab Component
+const ExclusionsTab = ({ showNotification }) => {
+  const [activeExclusionType, setActiveExclusionType] = useState('ioa');
+  const [ioaExclusions, setIoaExclusions] = useState([]);
+  const [mlExclusions, setMlExclusions] = useState([]);
+  const [svExclusions, setSvExclusions] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [showCreateDialog, setShowCreateDialog] = useState(false);
+  const [generatingReport, setGeneratingReport] = useState(false);
+  const [showReportDialog, setShowReportDialog] = useState(false);
+  const [reportData, setReportData] = useState(null);
+
+  const fetchExclusions = useCallback(async (type) => {
+    setLoading(true);
+    try {
+      const endpoint = type === 'ioa' ? 'ioa-exclusions' : type === 'ml' ? 'ml-exclusions' : 'sv-exclusions';
+      const response = await fetch(`${API_BASE}/${endpoint}`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error(`Failed to fetch ${type} exclusions`);
+      const data = await response.json();
+      if (type === 'ioa') setIoaExclusions(data);
+      else if (type === 'ml') setMlExclusions(data);
+      else setSvExclusions(data);
+    } catch (err) {
+      showNotification(`Error fetching ${type.toUpperCase()} exclusions: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [showNotification]);
+
+  useEffect(() => {
+    fetchExclusions(activeExclusionType);
+  }, [activeExclusionType, fetchExclusions]);
+
+  const handleDelete = async (type, id) => {
+    if (!window.confirm('Are you sure you want to delete this exclusion?')) return;
+    try {
+      const endpoint = type === 'ioa' ? 'ioa-exclusions' : type === 'ml' ? 'ml-exclusions' : 'sv-exclusions';
+      const response = await fetch(`${API_BASE}/${endpoint}/${id}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders()
+      });
+      if (!response.ok) throw new Error('Failed to delete exclusion');
+      showNotification('Exclusion deleted successfully', 'success');
+      fetchExclusions(type);
+    } catch (err) {
+      showNotification(`Error deleting exclusion: ${err.message}`, 'error');
+    }
+  };
+
+  // Risk analysis patterns
+  const criticalPatterns = [
+    { pattern: /^\*\*\/\*\*$|^\*\*\\/, desc: 'Catch-all wildcard exclusion' },
+    { pattern: /\/usr\/bin\/(bash|sh|curl|wget|rm|cp|chmod|chown)/i, desc: 'Critical Linux binaries' },
+    { pattern: /mimikatz|mimipenguin|lazagne|credential/i, desc: 'Credential dumping tool' },
+    { pattern: /c:\\windows\\system32\\cmd\.exe|powershell\.exe.*bypass/i, desc: 'Shell with bypass' },
+  ];
+  const highPatterns = [
+    { pattern: /\/tmp\/\*\*|\\temp\\\*\*/i, desc: 'Temp directory wildcard' },
+    { pattern: /atomicredteam|atomic.*red.*team/i, desc: 'Red team testing artifact' },
+    { pattern: /psexec|procdump|processhider|rootkit/i, desc: 'Offensive tool' },
+    { pattern: /wmiprvse|wmic|regsvr32/i, desc: 'LOLBin commonly abused' },
+  ];
+  const mediumPatterns = [
+    { pattern: /\*\*\\.*\\\*\*|\*\*\/.*\/\*\*/i, desc: 'Broad wildcard path' },
+    { pattern: /desktop\\\*|downloads\\\*/i, desc: 'User folder wildcard' },
+  ];
+
+  const analyzeExclusion = (exclusion, type) => {
+    const value = exclusion.value || exclusion.cl_regex || exclusion.ifn_regex || exclusion.pattern_name || '';
+    const name = exclusion.name || '';
+    const combined = `${name} ${value}`.toLowerCase();
+    const isGlobal = exclusion.applied_globally === true;
+    const createdDate = exclusion.created_on ? new Date(exclusion.created_on) : null;
+    const isStale = createdDate && (Date.now() - createdDate.getTime()) > 365 * 24 * 60 * 60 * 1000;
+
+    let risk = 'low';
+    let reason = '';
+
+    for (const p of criticalPatterns) {
+      if (p.pattern.test(combined)) { risk = 'critical'; reason = p.desc; break; }
+    }
+    if (risk === 'low') {
+      for (const p of highPatterns) {
+        if (p.pattern.test(combined)) { risk = 'high'; reason = p.desc; break; }
+      }
+    }
+    if (risk === 'low') {
+      for (const p of mediumPatterns) {
+        if (p.pattern.test(combined)) { risk = 'medium'; reason = p.desc; break; }
+      }
+    }
+    if (isGlobal && risk === 'low') { risk = 'medium'; reason = 'Globally applied'; }
+    if (isGlobal && risk === 'medium') { risk = 'high'; reason += ' + Globally applied'; }
+
+    return { ...exclusion, risk, reason, isStale, isGlobal, type };
+  };
+
+  const generateReport = async () => {
+    setGeneratingReport(true);
+    try {
+      // Fetch all exclusion types
+      const [ioaRes, mlRes, svRes] = await Promise.all([
+        fetch(`${API_BASE}/ioa-exclusions`, { headers: getAuthHeaders() }),
+        fetch(`${API_BASE}/ml-exclusions`, { headers: getAuthHeaders() }),
+        fetch(`${API_BASE}/sv-exclusions`, { headers: getAuthHeaders() })
+      ]);
+
+      const ioaData = ioaRes.ok ? await ioaRes.json() : [];
+      const mlData = mlRes.ok ? await mlRes.json() : [];
+      const svData = svRes.ok ? await svRes.json() : [];
+
+      // Analyze all exclusions
+      const analyzedIoa = ioaData.map(e => analyzeExclusion(e, 'ioa'));
+      const analyzedMl = mlData.map(e => analyzeExclusion(e, 'ml'));
+      const analyzedSv = svData.map(e => analyzeExclusion(e, 'sv'));
+      const allExclusions = [...analyzedIoa, ...analyzedMl, ...analyzedSv];
+
+      // Count by risk level
+      const counts = {
+        critical: allExclusions.filter(e => e.risk === 'critical').length,
+        high: allExclusions.filter(e => e.risk === 'high').length,
+        medium: allExclusions.filter(e => e.risk === 'medium').length,
+        low: allExclusions.filter(e => e.risk === 'low').length,
+        stale: allExclusions.filter(e => e.isStale).length,
+        global: allExclusions.filter(e => e.isGlobal).length,
+        ioa: ioaData.length,
+        ml: mlData.length,
+        sv: svData.length,
+        total: allExclusions.length
+      };
+
+      // Find duplicates (by similar value)
+      const valueMap = {};
+      allExclusions.forEach(e => {
+        const key = (e.value || e.cl_regex || '').toLowerCase().replace(/\s+/g, '');
+        if (key) {
+          if (!valueMap[key]) valueMap[key] = [];
+          valueMap[key].push(e);
+        }
+      });
+      const duplicates = Object.entries(valueMap).filter(([k, v]) => v.length > 1).map(([k, v]) => v);
+
+      setReportData({
+        counts,
+        critical: allExclusions.filter(e => e.risk === 'critical'),
+        high: allExclusions.filter(e => e.risk === 'high'),
+        medium: allExclusions.filter(e => e.risk === 'medium'),
+        low: allExclusions.filter(e => e.risk === 'low'),
+        stale: allExclusions.filter(e => e.isStale),
+        global: allExclusions.filter(e => e.isGlobal),
+        duplicates,
+        ioa: analyzedIoa,
+        ml: analyzedMl,
+        sv: analyzedSv,
+        all: allExclusions,
+        generatedAt: new Date().toLocaleString()
+      });
+      setShowReportDialog(true);
+    } catch (err) {
+      showNotification(`Error generating report: ${err.message}`, 'error');
+    } finally {
+      setGeneratingReport(false);
+    }
+  };
+
+  const openReportWindow = () => {
+    if (!reportData) return;
+    const html = generateReportHtml(reportData);
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank');
+  };
+
+  const generateReportHtml = (data) => {
+    const tenantName = localStorage.getItem('tenant_name') || 'Organization';
+    const reportDate = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+    const riskBadge = (risk) => {
+      const colors = { critical: '#BA0C2F', high: '#d4314f', medium: '#e8963a', low: '#2a9d8f' };
+      return `<span style="background:${colors[risk]};color:${risk === 'medium' ? '#1a1a2e' : '#fff'};padding:2px 8px;border-radius:3px;font-size:10px;font-weight:700">${risk.toUpperCase()}</span>`;
+    };
+
+    const findingBox = (ex, id, riskClass) => {
+      const bgColors = { critical: '#fdf2f4', high: '#fef5f2', medium: '#fefcf2', low: '#f0fdf4' };
+      const borderColors = { critical: '#BA0C2F', high: '#d4314f', medium: '#e8963a', low: '#2a9d8f' };
+      const typeLabel = ex.type === 'ioa' ? 'IOA' : ex.type === 'ml' ? 'ML Blocking' : 'Sensor Visibility';
+      return `<div style="border:1px solid #ddd;border-left:5px solid ${borderColors[ex.risk]};background:${bgColors[ex.risk]};border-radius:4px;padding:14px 16px;margin-bottom:14px;page-break-inside:avoid">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;gap:8px">
+          <div style="font-size:13px;font-weight:700;color:#012169">${id} — ${ex.name || ex.value || ex.id}</div>
+          ${riskBadge(ex.risk)}
+        </div>
+        <div style="font-size:11px;color:#777;margin-bottom:5px">${typeLabel} | ${ex.value || ex.cl_regex || ex.pattern_name || 'N/A'}${ex.isGlobal ? ' | <strong>Globally Applied</strong>' : ''}</div>
+        <div style="font-size:12px;color:#444;margin-bottom:6px">${ex.reason || 'Review recommended'}</div>
+        ${ex.description ? `<div style="font-size:12px;color:#012169;background:#e8edf5;padding:6px 10px;border-radius:4px;border-left:3px solid #012169">${ex.description}</div>` : ''}
+      </div>`;
+    };
+
+    const tableRow = (ex, idx) => {
+      const typeLabel = ex.type === 'ioa' ? 'IOA' : ex.type === 'ml' ? 'ML' : 'SV';
+      const created = ex.created_on ? new Date(ex.created_on).toLocaleDateString() : 'Unknown';
+      const patternVal = ex.value || ex.cl_regex || ex.pattern_name || 'N/A';
+      const nameVal = ex.name || ex.id || 'Unnamed';
+      const truncatedName = nameVal.length > 25 ? nameVal.substring(0, 22) + '...' : nameVal;
+      return `<tr style="${idx % 2 === 0 ? '' : 'background:#f8f9fc'}">
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8" title="${nameVal}">${truncatedName}</td>
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8;font-family:monospace;font-size:9px;word-break:break-word" title="${patternVal}">${patternVal}</td>
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8;text-align:center">${typeLabel}</td>
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8;text-align:center">${riskBadge(ex.risk)}</td>
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8;text-align:center">${ex.isGlobal ? 'Yes' : 'No'}</td>
+        <td style="padding:5px 8px;border-bottom:1px solid #e8e8e8;white-space:nowrap">${created}</td>
+      </tr>`;
+    };
+
+    return `<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>Exclusions Audit Report - ${tenantName}</title>
+<style>
+body{font-family:'Segoe UI',Calibri,Arial,sans-serif;color:#1a1a2e;margin:0;padding:20px;background:#eef0f4;font-size:13px;line-height:1.5}
+.wrap{max-width:860px;margin:0 auto;background:#fff;box-shadow:0 2px 16px rgba(1,33,105,.1)}
+.toolbar{background:#012169;padding:12px 20px;color:#fff;font-size:13px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:100}
+.toolbar button{background:#BA0C2F;color:#fff;border:none;padding:8px 18px;border-radius:4px;font-weight:700;cursor:pointer;font-size:13px}
+.toolbar button:hover{background:#9a0a27}
+.section{padding:36px 44px}
+.cover{padding:60px 50px;text-align:center;border-bottom:5px solid #012169;background:linear-gradient(180deg,#fff 60%,#e8edf5 100%)}
+.cover .logo{font-size:13px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:#BA0C2F;margin-bottom:6px}
+.cover h1{font-size:28px;font-weight:700;color:#012169;margin:0 0 4px}
+.cover .sub{font-size:17px;color:#1a3a7a;font-weight:600}
+.cover .meta td{padding:4px 14px;font-size:13px}.cover .meta td:first-child{font-weight:600;color:#012169}
+.sboxes{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:22px;max-width:500px;margin-left:auto;margin-right:auto}
+.sbox{text-align:center;padding:12px 6px;border-radius:6px;background:#fff;border:2px solid #012169}
+.sbox .n{font-size:24px;font-weight:700;color:#012169}.sbox .l{font-size:9px;text-transform:uppercase;letter-spacing:1px;color:#1a3a7a;font-weight:600}
+h2{font-size:18px;font-weight:700;color:#012169;border-bottom:3px solid #012169;padding-bottom:6px;margin:0 0 16px}
+h3{font-size:14px;font-weight:700;color:#012169;margin:16px 0 8px}
+.divider{border:none;height:2px;background:linear-gradient(90deg,#012169,#BA0C2F,#012169);margin:0;opacity:.3}
+.risk-bar{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0 16px}
+.rc{padding:4px 12px;border-radius:4px;font-size:11px;font-weight:700;color:#fff;display:inline-flex;align-items:center;gap:4px}
+.rc .ct{font-size:15px}
+table{width:100%;border-collapse:collapse;margin:10px 0;font-size:11px;page-break-inside:avoid}
+th{background:#012169;color:#fff;padding:6px 8px;text-align:left;font-weight:600;font-size:10px}
+td{padding:5px 8px;border-bottom:1px solid #e8e8e8;vertical-align:top}
+tr:nth-child(even){background:#f8f9fc}
+.p0{color:#BA0C2F;font-weight:700}.p1{color:#d4314f;font-weight:700}.p2{color:#c07a00;font-weight:700}.p3{color:#2a9d8f;font-weight:700}
+ul{padding-left:18px;margin:8px 0}li{margin-bottom:3px;font-size:12.5px}
+@media print{.toolbar{display:none!important}.wrap{box-shadow:none}.section{padding:28px 36px}body{background:#fff;padding:0}.page-break{page-break-before:always}}
+</style>
+</head><body>
+<div class="wrap">
+<div class="toolbar">
+  <div><strong>Exclusions Audit Report</strong> — Generated ${data.generatedAt}</div>
+  <button onclick="window.print()">Print Report</button>
+</div>
+
+<div class="cover">
+<div class="logo">CrowdStrike Falcon</div>
+<h1>Exclusions Audit Report</h1>
+<div class="sub">${tenantName}</div>
+<table class="meta" style="margin:20px auto 0;text-align:left;border-collapse:collapse">
+<tr><td>Report Date</td><td>${reportDate}</td></tr>
+<tr><td>Total Exclusions</td><td>${data.counts.total}</td></tr>
+</table>
+<div class="sboxes">
+<div class="sbox"><div class="n">${data.counts.sv}</div><div class="l">Sensor Visibility</div></div>
+<div class="sbox"><div class="n">${data.counts.ioa}</div><div class="l">IOA</div></div>
+<div class="sbox"><div class="n">${data.counts.ml}</div><div class="l">ML Blocking</div></div>
+<div class="sbox"><div class="n">${data.counts.total}</div><div class="l">Total</div></div>
+</div>
+</div>
+
+<div class="section">
+<h2>1. Executive Summary</h2>
+<p>This report presents an automated audit of <strong>${data.counts.total}</strong> CrowdStrike Falcon exclusions across three exclusion categories. Exclusions were analyzed for risk, scope, and hygiene on ${reportDate}.</p>
+<p style="margin-top:6px">The audit identified <strong>${data.counts.critical} critical</strong>, <strong>${data.counts.high} high-risk</strong>, <strong>${data.counts.medium} medium</strong>, and <strong>${data.counts.low} low-risk</strong> items. ${data.counts.stale > 0 ? `Additionally, <strong>${data.counts.stale}</strong> exclusions are older than 12 months and should be reviewed.` : ''} ${data.counts.global > 0 ? `<strong>${data.counts.global}</strong> exclusions are applied globally.` : ''}</p>
+<div class="risk-bar">
+<span class="rc" style="background:#BA0C2F"><span class="ct">${data.counts.critical}</span>Critical</span>
+<span class="rc" style="background:#d4314f"><span class="ct">${data.counts.high}</span>High</span>
+<span class="rc" style="background:#e8963a;color:#1a1a2e"><span class="ct">${data.counts.medium}</span>Medium</span>
+<span class="rc" style="background:#2a9d8f"><span class="ct">${data.counts.low}</span>Low</span>
+<span class="rc" style="background:#6b7280"><span class="ct">${data.counts.stale}</span>Stale</span>
+<span class="rc" style="background:#4b5563"><span class="ct">${data.duplicates.length}</span>Duplicates</span>
+</div>
+<h3>Key Recommendations</h3>
+<ul>
+${data.counts.critical > 0 ? '<li><strong>IMMEDIATELY</strong> review and address all critical findings.</li>' : ''}
+${data.counts.global > 0 ? '<li>Review all globally-applied exclusions — high blast radius if misconfigured.</li>' : ''}
+${data.counts.stale > 0 ? '<li>Establish a review cycle: any exclusion older than 12 months should be evaluated for removal.</li>' : ''}
+<li>Require ticket/comment references on all exclusions.</li>
+${data.duplicates.length > 0 ? `<li>Consolidate ${data.duplicates.length} duplicate exclusion groups.</li>` : ''}
+</ul>
+</div>
+<hr class="divider">
+
+${data.critical.length > 0 ? `
+<div class="section page-break">
+<h2>2. Critical Findings</h2>
+${data.critical.map((ex, i) => findingBox(ex, `CRIT-${String(i + 1).padStart(3, '0')}`, 'critical')).join('')}
+</div>
+<hr class="divider">` : ''}
+
+${data.high.length > 0 ? `
+<div class="section page-break">
+<h2>3. High Risk Findings</h2>
+${data.high.map((ex, i) => findingBox(ex, `HIGH-${String(i + 1).padStart(3, '0')}`, 'high')).join('')}
+</div>
+<hr class="divider">` : ''}
+
+${data.medium.length > 0 ? `
+<div class="section page-break">
+<h2>4. Medium Risk Findings</h2>
+${data.medium.map((ex, i) => findingBox(ex, `MED-${String(i + 1).padStart(3, '0')}`, 'medium')).join('')}
+</div>
+<hr class="divider">` : ''}
+
+${data.stale.length > 0 ? `
+<div class="section page-break">
+<h2>5. Stale Exclusions (12+ Months)</h2>
+<p>These exclusions were created more than 12 months ago and may no longer be necessary.</p>
+<table>
+<thead><tr><th style="width:15%">Name</th><th style="width:45%">Pattern</th><th style="width:8%">Type</th><th style="width:10%">Risk</th><th style="width:10%">Global</th><th style="width:12%">Created</th></tr></thead>
+<tbody>${data.stale.map((ex, i) => tableRow(ex, i)).join('')}</tbody>
+</table>
+</div>
+<hr class="divider">` : ''}
+
+${data.global.length > 0 ? `
+<div class="section page-break">
+<h2>6. Globally Applied Exclusions</h2>
+<p>These exclusions have <strong>Applied Globally = true</strong> — highest blast radius if misconfigured.</p>
+<table>
+<thead><tr><th style="width:15%">Name</th><th style="width:45%">Pattern</th><th style="width:8%">Type</th><th style="width:10%">Risk</th><th style="width:10%">Global</th><th style="width:12%">Created</th></tr></thead>
+<tbody>${data.global.map((ex, i) => tableRow(ex, i)).join('')}</tbody>
+</table>
+</div>
+<hr class="divider">` : ''}
+
+<div class="section page-break">
+<h2>7. Priority Matrix</h2>
+<table>
+<thead><tr><th>Priority</th><th>Action</th><th>Count</th></tr></thead>
+<tbody>
+${data.counts.critical > 0 ? `<tr><td class="p0">P0 — Immediate</td><td>Address critical findings</td><td>${data.counts.critical}</td></tr>` : ''}
+${data.counts.high > 0 ? `<tr><td class="p1">P1 — This Week</td><td>Review high-risk findings</td><td>${data.counts.high}</td></tr>` : ''}
+${data.counts.medium > 0 ? `<tr><td class="p2">P2 — This Month</td><td>Address medium-risk findings</td><td>${data.counts.medium}</td></tr>` : ''}
+${data.counts.stale > 0 ? `<tr><td class="p3">P3 — Next Quarter</td><td>Review stale exclusions</td><td>${data.counts.stale}</td></tr>` : ''}
+</tbody>
+</table>
+</div>
+<hr class="divider">
+
+<div class="section page-break">
+<h2>8. Complete Exclusion Inventory</h2>
+<h3>8.1 IOA Exclusions (${data.ioa.length} total)</h3>
+<table>
+<thead><tr><th style="width:15%">Name</th><th style="width:45%">Pattern</th><th style="width:8%">Type</th><th style="width:10%">Risk</th><th style="width:10%">Global</th><th style="width:12%">Created</th></tr></thead>
+<tbody>${data.ioa.map((ex, i) => tableRow(ex, i)).join('')}</tbody>
+</table>
+
+<h3>8.2 ML Exclusions (${data.ml.length} total)</h3>
+<table>
+<thead><tr><th style="width:15%">Name</th><th style="width:45%">Pattern</th><th style="width:8%">Type</th><th style="width:10%">Risk</th><th style="width:10%">Global</th><th style="width:12%">Created</th></tr></thead>
+<tbody>${data.ml.map((ex, i) => tableRow(ex, i)).join('')}</tbody>
+</table>
+
+<h3>8.3 Sensor Visibility Exclusions (${data.sv.length} total)</h3>
+<table>
+<thead><tr><th style="width:15%">Name</th><th style="width:45%">Pattern</th><th style="width:8%">Type</th><th style="width:10%">Risk</th><th style="width:10%">Global</th><th style="width:12%">Created</th></tr></thead>
+<tbody>${data.sv.map((ex, i) => tableRow(ex, i)).join('')}</tbody>
+</table>
+</div>
+
+</div>
+</body></html>`;
+  };
+
+  const currentExclusions = activeExclusionType === 'ioa' ? ioaExclusions :
+    activeExclusionType === 'ml' ? mlExclusions : svExclusions;
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold text-gray-800 dark:text-white">Exclusion Management</h2>
+        <div className="flex space-x-3">
+          <button
+            onClick={generateReport}
+            disabled={generatingReport}
+            className="flex items-center px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+          >
+            <FileText className="w-4 h-4 mr-2" />
+            {generatingReport ? 'Generating...' : 'Generate Report'}
+          </button>
+          <button
+            onClick={() => setShowCreateDialog(true)}
+            className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+            <Plus className="w-4 h-4 mr-2" />
+            Create Exclusion
+          </button>
+        </div>
+      </div>
+
+      {/* Exclusion Type Tabs */}
+      <div className="flex space-x-4 mb-6 border-b border-gray-200 dark:border-gray-700">
+        {[
+          { id: 'ioa', name: 'IOA Exclusions' },
+          { id: 'ml', name: 'ML Exclusions' },
+          { id: 'sv', name: 'Sensor Visibility' }
+        ].map((type) => (
+          <button
+            key={type.id}
+            onClick={() => setActiveExclusionType(type.id)}
+            className={`pb-2 px-4 font-medium text-sm border-b-2 ${
+              activeExclusionType === type.id
+                ? 'border-blue-600 text-blue-600'
+                : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400'
+            }`}
+          >
+            {type.name}
+          </button>
+        ))}
+      </div>
+
+      {/* Refresh Button */}
+      <div className="mb-4">
+        <button
+          onClick={() => fetchExclusions(activeExclusionType)}
+          disabled={loading}
+          className="flex items-center px-3 py-1 text-sm bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600"
+        >
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+
+      {/* Exclusions List */}
+      {loading ? (
+        <div className="text-center py-12">
+          <RefreshCw className="w-8 h-8 animate-spin mx-auto text-gray-400" />
+          <p className="text-gray-500 mt-2">Loading exclusions...</p>
+        </div>
+      ) : currentExclusions.length === 0 ? (
+        <div className="text-center py-12 bg-gray-50 dark:bg-gray-900 rounded-lg">
+          <Shield className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <p className="text-gray-600 dark:text-gray-400">No {activeExclusionType.toUpperCase()} exclusions found</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {currentExclusions.map((exclusion) => (
+            <div key={exclusion.id} className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow">
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <h3 className="font-semibold text-gray-800 dark:text-white">
+                    {exclusion.name || exclusion.value || exclusion.id}
+                  </h3>
+                  {exclusion.description && (
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{exclusion.description}</p>
+                  )}
+                  {exclusion.comment && (
+                    <p className="text-sm text-gray-500 dark:text-gray-500 mt-1 italic">"{exclusion.comment}"</p>
+                  )}
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {exclusion.groups && exclusion.groups.map((group, idx) => (
+                      <span key={idx} className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 text-xs rounded">
+                        {group.name || group}
+                      </span>
+                    ))}
+                    {exclusion.excluded_from && exclusion.excluded_from.map((ef, idx) => (
+                      <span key={idx} className="px-2 py-1 bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200 text-xs rounded">
+                        {ef}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-2">
+                    Created: {exclusion.created_on ? new Date(exclusion.created_on).toLocaleDateString() : 'Unknown'}
+                    {exclusion.created_by && ` by ${exclusion.created_by}`}
+                  </p>
+                </div>
+                <button
+                  onClick={() => handleDelete(activeExclusionType, exclusion.id)}
+                  className="p-2 text-red-600 hover:bg-red-100 dark:hover:bg-red-900 rounded"
+                  title="Delete exclusion"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Create Exclusion Dialog */}
+      {showCreateDialog && (
+        <ExclusionCreateDialog
+          type={activeExclusionType}
+          onClose={() => setShowCreateDialog(false)}
+          onSuccess={() => {
+            setShowCreateDialog(false);
+            fetchExclusions(activeExclusionType);
+            showNotification('Exclusion created successfully', 'success');
+          }}
+          showNotification={showNotification}
+        />
+      )}
+
+      {/* Report Preview Dialog */}
+      {showReportDialog && reportData && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-4xl w-full max-h-[90vh] overflow-hidden">
+            <div className="flex justify-between items-center p-4 border-b dark:border-gray-700">
+              <h3 className="text-lg font-semibold text-gray-800 dark:text-white">Exclusions Audit Report</h3>
+              <button onClick={() => setShowReportDialog(false)} className="text-gray-500 hover:text-gray-700">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto max-h-[60vh]">
+              <div className="grid grid-cols-4 gap-4 mb-6">
+                <div className="text-center p-4 bg-gray-50 dark:bg-gray-900 rounded-lg">
+                  <div className="text-3xl font-bold text-gray-800 dark:text-white">{reportData.counts.total}</div>
+                  <div className="text-sm text-gray-500">Total</div>
+                </div>
+                <div className="text-center p-4 bg-red-50 dark:bg-red-900/20 rounded-lg">
+                  <div className="text-3xl font-bold text-red-600">{reportData.counts.critical}</div>
+                  <div className="text-sm text-gray-500">Critical</div>
+                </div>
+                <div className="text-center p-4 bg-orange-50 dark:bg-orange-900/20 rounded-lg">
+                  <div className="text-3xl font-bold text-orange-600">{reportData.counts.high}</div>
+                  <div className="text-sm text-gray-500">High</div>
+                </div>
+                <div className="text-center p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">
+                  <div className="text-3xl font-bold text-yellow-600">{reportData.counts.medium}</div>
+                  <div className="text-sm text-gray-500">Medium</div>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-4 mb-6">
+                <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-center">
+                  <div className="text-xl font-semibold text-blue-600">{reportData.counts.ioa}</div>
+                  <div className="text-xs text-gray-500">IOA Exclusions</div>
+                </div>
+                <div className="p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg text-center">
+                  <div className="text-xl font-semibold text-purple-600">{reportData.counts.ml}</div>
+                  <div className="text-xs text-gray-500">ML Exclusions</div>
+                </div>
+                <div className="p-3 bg-green-50 dark:bg-green-900/20 rounded-lg text-center">
+                  <div className="text-xl font-semibold text-green-600">{reportData.counts.sv}</div>
+                  <div className="text-xs text-gray-500">Sensor Visibility</div>
+                </div>
+              </div>
+              <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
+                <p><strong>{reportData.counts.stale}</strong> exclusions are older than 12 months (stale)</p>
+                <p><strong>{reportData.counts.global}</strong> exclusions are applied globally</p>
+                <p><strong>{reportData.duplicates.length}</strong> potential duplicate groups detected</p>
+              </div>
+              {reportData.critical.length > 0 && (
+                <div className="mt-4 p-3 bg-red-100 dark:bg-red-900/30 rounded-lg">
+                  <h4 className="font-semibold text-red-800 dark:text-red-200 mb-2">Critical Findings</h4>
+                  <ul className="text-sm text-red-700 dark:text-red-300 space-y-1">
+                    {reportData.critical.slice(0, 3).map((ex, i) => (
+                      <li key={i}>• {ex.name || ex.value || ex.id}: {ex.reason}</li>
+                    ))}
+                    {reportData.critical.length > 3 && <li>• ... and {reportData.critical.length - 3} more</li>}
+                  </ul>
+                </div>
+              )}
+            </div>
+            <div className="flex justify-end space-x-3 p-4 border-t dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+              <button
+                onClick={() => setShowReportDialog(false)}
+                className="px-4 py-2 text-gray-600 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+              >
+                Close
+              </button>
+              <button
+                onClick={openReportWindow}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              >
+                Open Full Report
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Exclusion Create Dialog Component
+const ExclusionCreateDialog = ({ type, onClose, onSuccess, showNotification }) => {
+  const [formData, setFormData] = useState({
+    name: '',
+    value: '',
+    description: '',
+    comment: '',
+    cl_regex: '',
+    ifn_regex: '',
+    pattern_id: '',
+    pattern_name: '',
+    excluded_from: ['blocking']
+  });
+  const [submitting, setSubmitting] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setSubmitting(true);
+    try {
+      const endpoint = type === 'ioa' ? 'ioa-exclusions' : type === 'ml' ? 'ml-exclusions' : 'sv-exclusions';
+      const response = await fetch(`${API_BASE}/${endpoint}`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(formData)
+      });
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || 'Failed to create exclusion');
+      }
+      onSuccess();
+    } catch (err) {
+      showNotification(`Error creating exclusion: ${err.message}`, 'error');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-xl font-bold text-gray-800 dark:text-white">
+            Create {type.toUpperCase()} Exclusion
+          </h3>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {type === 'ioa' && (
+            <>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Name</label>
+                <input
+                  type="text"
+                  value={formData.name}
+                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                  className="w-full px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                  required
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Command Line Regex</label>
+                <input
+                  type="text"
+                  value={formData.cl_regex}
+                  onChange={(e) => setFormData({ ...formData, cl_regex: e.target.value })}
+                  className="w-full px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                  placeholder=".*pattern.*"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Image Filename Regex</label>
+                <input
+                  type="text"
+                  value={formData.ifn_regex}
+                  onChange={(e) => setFormData({ ...formData, ifn_regex: e.target.value })}
+                  className="w-full px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                  placeholder=".*\\filename\\.exe"
+                />
+              </div>
+            </>
+          )}
+
+          {(type === 'ml' || type === 'sv') && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                {type === 'ml' ? 'File Path/Hash' : 'Path Pattern'}
+              </label>
+              <input
+                type="text"
+                value={formData.value}
+                onChange={(e) => setFormData({ ...formData, value: e.target.value })}
+                className="w-full px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                placeholder={type === 'ml' ? 'C:\\path\\to\\file.exe or SHA256 hash' : '/path/to/exclude/**'}
+                required
+              />
+            </div>
+          )}
+
+          {type === 'ml' && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Exclude From</label>
+              <div className="flex flex-wrap gap-2">
+                {['blocking', 'extraction'].map((opt) => (
+                  <label key={opt} className="flex items-center">
+                    <input
+                      type="checkbox"
+                      checked={formData.excluded_from.includes(opt)}
+                      onChange={(e) => {
+                        const newList = e.target.checked
+                          ? [...formData.excluded_from, opt]
+                          : formData.excluded_from.filter(o => o !== opt);
+                        setFormData({ ...formData, excluded_from: newList });
+                      }}
+                      className="mr-2"
+                    />
+                    <span className="text-sm text-gray-700 dark:text-gray-300 capitalize">{opt}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Comment</label>
+            <textarea
+              value={formData.comment}
+              onChange={(e) => setFormData({ ...formData, comment: e.target.value })}
+              className="w-full px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              rows="2"
+              placeholder="Reason for exclusion..."
+            />
+          </div>
+
+          <div className="flex justify-end space-x-2 pt-4">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+            >
+              {submitting ? 'Creating...' : 'Create Exclusion'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// Incidents Tab Component
+const IncidentsTab = ({ showNotification }) => {
+  const [incidents, setIncidents] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [selectedIncident, setSelectedIncident] = useState(null);
+
+  const fetchIncidents = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: '100' });
+      if (statusFilter !== 'all') params.append('status', statusFilter);
+
+      const response = await fetch(`${API_BASE}/incidents?${params}`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error('Failed to fetch incidents');
+      const data = await response.json();
+      setIncidents(data.incidents || []);
+    } catch (err) {
+      showNotification(`Error fetching incidents: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [statusFilter, showNotification]);
+
+  useEffect(() => {
+    fetchIncidents();
+  }, [fetchIncidents]);
+
+  const handleStatusChange = async (incidentId, newStatus) => {
+    try {
+      const response = await fetch(`${API_BASE}/incidents/${incidentId}/status`, {
+        method: 'PATCH',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ status: newStatus })
+      });
+      if (!response.ok) throw new Error('Failed to update status');
+      showNotification('Incident status updated', 'success');
+      fetchIncidents();
+    } catch (err) {
+      showNotification(`Error updating status: ${err.message}`, 'error');
+    }
+  };
+
+  const getIncidentStatusLabel = (status) => {
+    const statusMap = {
+      20: 'new',
+      25: 'reopened',
+      30: 'in_progress',
+      40: 'closed'
+    };
+    if (typeof status === 'number') {
+      return statusMap[status] || 'unknown';
+    }
+    return status || 'unknown';
+  };
+
+  const getStatusBadge = (status) => {
+    const normalizedStatus = getIncidentStatusLabel(status);
+    const styles = {
+      new: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+      in_progress: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+      closed: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200',
+      reopened: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200'
+    };
+    return styles[normalizedStatus] || 'bg-gray-100 text-gray-800';
+  };
+
+  const getSeverityColor = (severity) => {
+    if (severity >= 80) return 'text-red-600 dark:text-red-400';
+    if (severity >= 60) return 'text-orange-600 dark:text-orange-400';
+    if (severity >= 40) return 'text-yellow-600 dark:text-yellow-400';
+    return 'text-gray-600 dark:text-gray-400';
+  };
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold text-gray-800 dark:text-white">Incidents</h2>
+        <div className="flex items-center space-x-4">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value)}
+            className="px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+          >
+            <option value="all">All Statuses</option>
+            <option value="new">New</option>
+            <option value="in_progress">In Progress</option>
+            <option value="reopened">Reopened</option>
+            <option value="closed">Closed</option>
+          </select>
+          <button
+            onClick={fetchIncidents}
+            disabled={loading}
+            className="flex items-center px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600"
+          >
+            <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-12">
+          <RefreshCw className="w-8 h-8 animate-spin mx-auto text-gray-400" />
+          <p className="text-gray-500 mt-2">Loading incidents...</p>
+        </div>
+      ) : incidents.length === 0 ? (
+        <div className="text-center py-12 bg-gray-50 dark:bg-gray-900 rounded-lg">
+          <Zap className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <p className="text-gray-600 dark:text-gray-400">No incidents found</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {incidents.map((incident) => (
+            <div
+              key={incident.incident_id}
+              className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow cursor-pointer"
+              onClick={() => setSelectedIncident(selectedIncident?.incident_id === incident.incident_id ? null : incident)}
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <div className="flex items-center space-x-3 mb-2">
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${getStatusBadge(incident.status)}`}>
+                      {getIncidentStatusLabel(incident.status).replace('_', ' ').toUpperCase()}
+                    </span>
+                    <span className={`font-semibold ${getSeverityColor(incident.fine_score || 0)}`}>
+                      Score: {incident.fine_score || 0}
+                    </span>
+                  </div>
+                  <h3 className="font-semibold text-gray-800 dark:text-white mb-1">
+                    {incident.incident_id}
+                  </h3>
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    Hosts: {incident.hosts?.length || 0} | Users: {incident.users?.length || 0}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Created: {incident.start ? new Date(incident.start).toLocaleString() : 'Unknown'}
+                    {incident.end && ` | Ended: ${new Date(incident.end).toLocaleString()}`}
+                  </p>
+                </div>
+                <div className="flex space-x-2">
+                  {getIncidentStatusLabel(incident.status) !== 'closed' && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleStatusChange(incident.incident_id, 'closed'); }}
+                      className="px-3 py-1 text-sm bg-green-600 text-white rounded hover:bg-green-700"
+                    >
+                      Close
+                    </button>
+                  )}
+                  {getIncidentStatusLabel(incident.status) === 'new' && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); handleStatusChange(incident.incident_id, 'in_progress'); }}
+                      className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
+                    >
+                      Start
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Expanded Details */}
+              {selectedIncident?.incident_id === incident.incident_id && (
+                <div className="mt-4 pt-4 border-t dark:border-gray-700">
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Hosts Involved</h4>
+                      <div className="space-y-1">
+                        {incident.hosts?.map((host, idx) => (
+                          <div key={idx} className="text-gray-600 dark:text-gray-400">
+                            {typeof host === 'object' ? (host.hostname || host.device_id || 'Unknown') : host}
+                          </div>
+                        )) || <span className="text-gray-500">None</span>}
+                      </div>
+                    </div>
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Users Involved</h4>
+                      <div className="space-y-1">
+                        {incident.users?.map((user, idx) => (
+                          <div key={idx} className="text-gray-600 dark:text-gray-400">
+                            {typeof user === 'object' ? (user.user_name || user.name || 'Unknown') : user}
+                          </div>
+                        )) || <span className="text-gray-500">None</span>}
+                      </div>
+                    </div>
+                  </div>
+                  {incident.tactics && incident.tactics.length > 0 && (
+                    <div className="mt-4">
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">MITRE Tactics</h4>
+                      <div className="flex flex-wrap gap-2">
+                        {incident.tactics.map((tactic, idx) => (
+                          <span key={idx} className="px-2 py-1 bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 text-xs rounded">
+                            {typeof tactic === 'object' ? tactic.name : tactic}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {incident.techniques && incident.techniques.length > 0 && (
+                    <div className="mt-4">
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">MITRE Techniques</h4>
+                      <div className="flex flex-wrap gap-2">
+                        {incident.techniques.map((technique, idx) => (
+                          <span key={idx} className="px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200 text-xs rounded">
+                            {typeof technique === 'object' ? technique.name : technique}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Prevention Policies Tab Component
+const PoliciesTab = ({ showNotification }) => {
+  const [policies, setPolicies] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedPolicy, setSelectedPolicy] = useState(null);
+  const [policyMembers, setPolicyMembers] = useState({});
+
+  const fetchPolicies = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/prevention-policies`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error('Failed to fetch policies');
+      const data = await response.json();
+      setPolicies(data || []);
+    } catch (err) {
+      showNotification(`Error fetching policies: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [showNotification]);
+
+  useEffect(() => {
+    fetchPolicies();
+  }, [fetchPolicies]);
+
+  const fetchPolicyMembers = async (policyId) => {
+    try {
+      const response = await fetch(`${API_BASE}/prevention-policies/${policyId}/members`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error('Failed to fetch members');
+      const data = await response.json();
+      setPolicyMembers(prev => ({ ...prev, [policyId]: data }));
+    } catch (err) {
+      showNotification(`Error fetching policy members: ${err.message}`, 'error');
+    }
+  };
+
+  const getPlatformIcon = (platform) => {
+    switch (platform?.toLowerCase()) {
+      case 'windows': return '🪟';
+      case 'mac': return '🍎';
+      case 'linux': return '🐧';
+      default: return '💻';
+    }
+  };
+
+  const getSettingValue = (settings, key) => {
+    const setting = settings?.prevention_settings?.find(s => s.id === key);
+    return setting?.value;
+  };
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold text-gray-800 dark:text-white">Prevention Policies</h2>
+        <button
+          onClick={fetchPolicies}
+          disabled={loading}
+          className="flex items-center px-3 py-2 bg-gray-100 dark:bg-gray-700 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600"
+        >
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+
+      {loading ? (
+        <div className="text-center py-12">
+          <RefreshCw className="w-8 h-8 animate-spin mx-auto text-gray-400" />
+          <p className="text-gray-500 mt-2">Loading policies...</p>
+        </div>
+      ) : policies.length === 0 ? (
+        <div className="text-center py-12 bg-gray-50 dark:bg-gray-900 rounded-lg">
+          <Shield className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <p className="text-gray-600 dark:text-gray-400">No prevention policies found</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {policies.map((policy) => (
+            <div
+              key={policy.id}
+              className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow"
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <div className="flex items-center space-x-3 mb-2">
+                    <span className="text-2xl">{getPlatformIcon(policy.platform_name)}</span>
+                    <h3 className="font-semibold text-lg text-gray-800 dark:text-white">{policy.name}</h3>
+                    {policy.enabled ? (
+                      <span className="px-2 py-1 bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 text-xs rounded">Enabled</span>
+                    ) : (
+                      <span className="px-2 py-1 bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300 text-xs rounded">Disabled</span>
+                    )}
+                  </div>
+                  {policy.description && (
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{policy.description}</p>
+                  )}
+                  <div className="flex flex-wrap gap-2 text-xs text-gray-500 dark:text-gray-400">
+                    <span>Platform: <strong>{policy.platform_name}</strong></span>
+                    <span>|</span>
+                    <span>Groups: <strong>{policy.groups?.length || 0}</strong></span>
+                    <span>|</span>
+                    <span>Created: {policy.created_timestamp ? new Date(policy.created_timestamp).toLocaleDateString() : 'Unknown'}</span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    if (selectedPolicy?.id === policy.id) {
+                      setSelectedPolicy(null);
+                    } else {
+                      setSelectedPolicy(policy);
+                      if (!policyMembers[policy.id]) {
+                        fetchPolicyMembers(policy.id);
+                      }
+                    }
+                  }}
+                  className="px-3 py-1 text-sm bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-200 rounded hover:bg-blue-200 dark:hover:bg-blue-800"
+                >
+                  {selectedPolicy?.id === policy.id ? 'Hide Details' : 'View Details'}
+                </button>
+              </div>
+
+              {/* Expanded Details */}
+              {selectedPolicy?.id === policy.id && (
+                <div className="mt-4 pt-4 border-t dark:border-gray-700">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {/* Prevention Settings */}
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-3">Prevention Settings</h4>
+                      <div className="space-y-2 text-sm">
+                        {policy.prevention_settings?.slice(0, 10).map((setting, idx) => (
+                          <div key={idx} className="flex justify-between items-center py-1 border-b dark:border-gray-700">
+                            <span className="text-gray-600 dark:text-gray-400">{setting.name || setting.id}</span>
+                            <span className={`font-medium ${
+                              setting.value?.enabled ? 'text-green-600 dark:text-green-400' :
+                              setting.value?.detection === 'MODERATE' || setting.value?.detection === 'AGGRESSIVE' ? 'text-yellow-600' :
+                              'text-gray-500'
+                            }`}>
+                              {typeof setting.value === 'object' ?
+                                (setting.value.enabled ? '✓ Enabled' : setting.value.detection || 'Configured') :
+                                String(setting.value)}
+                            </span>
+                          </div>
+                        ))}
+                        {policy.prevention_settings?.length > 10 && (
+                          <p className="text-gray-500 text-xs mt-2">+{policy.prevention_settings.length - 10} more settings</p>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Assigned Groups & Members */}
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-3">Assigned Groups</h4>
+                      <div className="space-y-2">
+                        {policy.groups?.length > 0 ? (
+                          policy.groups.map((group, idx) => (
+                            <div key={idx} className="px-3 py-2 bg-gray-50 dark:bg-gray-900 rounded">
+                              <span className="font-medium text-gray-800 dark:text-white">{group.name}</span>
+                              <p className="text-xs text-gray-500">{group.description || 'No description'}</p>
+                            </div>
+                          ))
+                        ) : (
+                          <p className="text-gray-500 text-sm">No groups assigned</p>
+                        )}
+                      </div>
+
+                      {policyMembers[policy.id] && (
+                        <div className="mt-4">
+                          <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">
+                            Member Hosts ({policyMembers[policy.id].total || 0})
+                          </h4>
+                          <p className="text-sm text-gray-500">
+                            {policyMembers[policy.id].host_ids?.length || 0} hosts assigned to this policy
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Intel Tab Component
+const IntelTab = ({ showNotification }) => {
+  const [activeIntelType, setActiveIntelType] = useState('actors');
+  const [actors, setActors] = useState([]);
+  const [indicators, setIndicators] = useState([]);
+  const [reports, setReports] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedItem, setSelectedItem] = useState(null);
+
+  const fetchIntelData = useCallback(async (type, query = '') => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: '50' });
+      if (query) params.append('q', query);
+
+      const response = await fetch(`${API_BASE}/intel/${type}?${params}`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error(`Failed to fetch ${type}`);
+      const data = await response.json();
+
+      if (type === 'actors') setActors(data.actors || []);
+      else if (type === 'indicators') setIndicators(data.indicators || []);
+      else if (type === 'reports') setReports(data.reports || []);
+    } catch (err) {
+      showNotification(`Error fetching intel ${type}: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [showNotification]);
+
+  useEffect(() => {
+    fetchIntelData(activeIntelType, searchQuery);
+  }, [activeIntelType, fetchIntelData]);
+
+  const handleSearch = () => {
+    fetchIntelData(activeIntelType, searchQuery);
+  };
+
+  const currentData = activeIntelType === 'actors' ? actors :
+    activeIntelType === 'indicators' ? indicators : reports;
+
+  const getActorMotivation = (actor) => {
+    if (actor.motivations?.length > 0) return actor.motivations.join(', ');
+    return 'Unknown';
+  };
+
+  const getThreatLevel = (level) => {
+    const colors = {
+      high: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+      medium: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200',
+      low: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200'
+    };
+    return colors[level?.toLowerCase()] || 'bg-gray-100 text-gray-800';
+  };
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold text-gray-800 dark:text-white">Threat Intelligence</h2>
+        <div className="flex items-center space-x-2">
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
+            placeholder="Search intel..."
+            className="px-3 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white w-64"
+          />
+          <button
+            onClick={handleSearch}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+            <Search className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Intel Type Tabs */}
+      <div className="flex space-x-4 mb-6 border-b border-gray-200 dark:border-gray-700">
+        {[
+          { id: 'actors', name: 'Threat Actors' },
+          { id: 'indicators', name: 'Indicators' },
+          { id: 'reports', name: 'Reports' }
+        ].map((type) => (
+          <button
+            key={type.id}
+            onClick={() => { setActiveIntelType(type.id); setSelectedItem(null); }}
+            className={`pb-2 px-4 font-medium text-sm border-b-2 ${
+              activeIntelType === type.id
+                ? 'border-blue-600 text-blue-600'
+                : 'border-transparent text-gray-500 hover:text-gray-700 dark:text-gray-400'
+            }`}
+          >
+            {type.name}
+          </button>
+        ))}
+      </div>
+
+      {/* Refresh Button */}
+      <div className="mb-4">
+        <button
+          onClick={() => fetchIntelData(activeIntelType, searchQuery)}
+          disabled={loading}
+          className="flex items-center px-3 py-1 text-sm bg-gray-100 dark:bg-gray-700 rounded hover:bg-gray-200 dark:hover:bg-gray-600"
+        >
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+
+      {/* Content */}
+      {loading ? (
+        <div className="text-center py-12">
+          <RefreshCw className="w-8 h-8 animate-spin mx-auto text-gray-400" />
+          <p className="text-gray-500 mt-2">Loading intel data...</p>
+        </div>
+      ) : currentData.length === 0 ? (
+        <div className="text-center py-12 bg-gray-50 dark:bg-gray-900 rounded-lg">
+          <Globe className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+          <p className="text-gray-600 dark:text-gray-400">No {activeIntelType} found</p>
+          <p className="text-sm text-gray-500 mt-1">Try a different search query</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {/* Actors View */}
+          {activeIntelType === 'actors' && actors.map((actor) => (
+            <div
+              key={actor.id}
+              className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow cursor-pointer"
+              onClick={() => setSelectedItem(selectedItem?.id === actor.id ? null : actor)}
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <div className="flex items-center space-x-3 mb-2">
+                    <h3 className="font-semibold text-lg text-gray-800 dark:text-white">{actor.name}</h3>
+                    {actor.known_as && (
+                      <span className="text-sm text-gray-500">aka {actor.known_as}</span>
+                    )}
+                  </div>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                    {actor.short_description || actor.description?.substring(0, 200) + '...' || 'No description available'}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {actor.origins?.map((origin, idx) => (
+                      <span key={idx} className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 text-xs rounded">
+                        {origin.value || origin}
+                      </span>
+                    ))}
+                    <span className="px-2 py-1 bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 text-xs rounded">
+                      {getActorMotivation(actor)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {selectedItem?.id === actor.id && (
+                <div className="mt-4 pt-4 border-t dark:border-gray-700">
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Target Industries</h4>
+                      <div className="flex flex-wrap gap-1">
+                        {actor.target_industries?.map((ind, idx) => (
+                          <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-xs rounded">{ind.value || ind}</span>
+                        )) || <span className="text-gray-500">Unknown</span>}
+                      </div>
+                    </div>
+                    <div>
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Target Countries</h4>
+                      <div className="flex flex-wrap gap-1">
+                        {actor.target_countries?.map((country, idx) => (
+                          <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-xs rounded">{country.value || country}</span>
+                        )) || <span className="text-gray-500">Unknown</span>}
+                      </div>
+                    </div>
+                  </div>
+                  {actor.description && (
+                    <div className="mt-4">
+                      <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Full Description</h4>
+                      <p className="text-sm text-gray-600 dark:text-gray-400">{actor.description}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+
+          {/* Indicators View */}
+          {activeIntelType === 'indicators' && indicators.map((indicator) => (
+            <div
+              key={indicator.id}
+              className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow"
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <div className="flex items-center space-x-3 mb-2">
+                    <span className={`px-2 py-1 rounded text-xs font-medium ${getThreatLevel(indicator.malicious_confidence)}`}>
+                      {indicator.malicious_confidence || 'Unknown'} Confidence
+                    </span>
+                    <span className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200 text-xs rounded">
+                      {indicator.type}
+                    </span>
+                  </div>
+                  <p className="font-mono text-sm text-gray-800 dark:text-white mb-2 break-all">
+                    {indicator.indicator}
+                  </p>
+                  <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+                    {indicator.labels?.map((label, idx) => (
+                      <span key={idx} className="px-2 py-1 bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200 rounded">
+                        {typeof label === 'object' ? (label.value || label.name || label.slug) : label}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-2">
+                    Published: {indicator.published_date ? new Date(indicator.published_date).toLocaleDateString() : 'Unknown'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {/* Reports View */}
+          {activeIntelType === 'reports' && reports.map((report) => (
+            <div
+              key={report.id}
+              className="border dark:border-gray-700 rounded-lg p-4 bg-white dark:bg-gray-800 hover:shadow-md transition-shadow cursor-pointer"
+              onClick={() => setSelectedItem(selectedItem?.id === report.id ? null : report)}
+            >
+              <div className="flex justify-between items-start">
+                <div className="flex-1">
+                  <h3 className="font-semibold text-gray-800 dark:text-white mb-2">{report.name}</h3>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">
+                    {report.short_description || report.description?.substring(0, 200) + '...' || 'No description'}
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    {report.tags?.slice(0, 5).map((tag, idx) => (
+                      <span key={idx} className="px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200 text-xs rounded">
+                        {typeof tag === 'object' ? (tag.value || tag.slug || tag.name) : tag}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-2">
+                    Created: {report.created_date ? new Date(report.created_date).toLocaleDateString() : 'Unknown'}
+                  </p>
+                </div>
+              </div>
+
+              {selectedItem?.id === report.id && report.description && (
+                <div className="mt-4 pt-4 border-t dark:border-gray-700">
+                  <h4 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Full Description</h4>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 whitespace-pre-wrap">{report.description}</p>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Actor Detail Dialog Component
+const ActorDetailDialog = ({ actor, onClose, onNavigateToIntel }) => {
+  if (!actor) return null;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-full max-w-2xl max-h-[80vh] overflow-y-auto">
+        <div className="flex justify-between items-start mb-4">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">{actor.name}</h2>
+            {actor.known_as && (
+              <p className="text-sm text-gray-500 dark:text-gray-400">Also known as: {actor.known_as}</p>
+            )}
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        {/* Actor metadata badges */}
+        <div className="flex flex-wrap gap-2 mb-4">
+          {actor.origins?.map((origin, idx) => (
+            <span key={idx} className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 text-xs rounded">
+              {origin.value || origin}
+            </span>
+          ))}
+          {actor.motivations?.map((motivation, idx) => (
+            <span key={idx} className="px-2 py-1 bg-purple-100 dark:bg-purple-900 text-purple-800 dark:text-purple-200 text-xs rounded">
+              {motivation.value || motivation}
+            </span>
+          ))}
+        </div>
+
+        {/* Description */}
+        {(actor.short_description || actor.description) && (
+          <div className="mb-4">
+            <h3 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Description</h3>
+            <p className="text-sm text-gray-600 dark:text-gray-400">{actor.short_description || actor.description}</p>
+          </div>
+        )}
+
+        {/* Target Information */}
+        <div className="grid grid-cols-2 gap-4 mb-4">
+          <div>
+            <h3 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Target Industries</h3>
+            <div className="flex flex-wrap gap-1">
+              {actor.target_industries?.length > 0 ? (
+                actor.target_industries.slice(0, 8).map((ind, idx) => (
+                  <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-xs rounded text-gray-700 dark:text-gray-300">
+                    {ind.value || ind}
+                  </span>
+                ))
+              ) : (
+                <span className="text-gray-500 dark:text-gray-400 text-sm">Unknown</span>
+              )}
+            </div>
+          </div>
+          <div>
+            <h3 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Target Countries</h3>
+            <div className="flex flex-wrap gap-1">
+              {actor.target_countries?.length > 0 ? (
+                actor.target_countries.slice(0, 8).map((country, idx) => (
+                  <span key={idx} className="px-2 py-1 bg-gray-100 dark:bg-gray-700 text-xs rounded text-gray-700 dark:text-gray-300">
+                    {country.value || country}
+                  </span>
+                ))
+              ) : (
+                <span className="text-gray-500 dark:text-gray-400 text-sm">Unknown</span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* MITRE ATT&CK Techniques used by actor */}
+        {actor.kill_chain?.length > 0 && (
+          <div className="mb-4">
+            <h3 className="font-medium text-gray-700 dark:text-gray-300 mb-2">Known Techniques (MITRE ATT&CK)</h3>
+            <div className="flex flex-wrap gap-2">
+              {actor.kill_chain.slice(0, 10).map((technique, idx) => (
+                <a
+                  key={idx}
+                  href={`https://attack.mitre.org/techniques/${technique.technique_id}/`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-2 py-1 bg-indigo-100 dark:bg-indigo-900 text-indigo-800 dark:text-indigo-200 text-xs rounded hover:bg-indigo-200 dark:hover:bg-indigo-800 flex items-center"
+                >
+                  {technique.technique_id}: {technique.technique}
+                  <ExternalLink className="w-3 h-3 ml-1" />
+                </a>
+              ))}
+              {actor.kill_chain.length > 10 && (
+                <span className="text-xs text-gray-500 dark:text-gray-400 self-center">
+                  +{actor.kill_chain.length - 10} more
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="flex justify-end space-x-3 mt-6 pt-4 border-t dark:border-gray-700">
+          <button
+            onClick={() => {
+              onNavigateToIntel();
+              onClose();
+            }}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center"
+          >
+            <Globe className="w-4 h-4 mr-2" />
+            View in Intel Tab
+          </button>
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Bulk Actor Correlation Results Dialog
+const BulkActorResultsDialog = ({ results, onClose, onViewActor, detectionActors }) => {
+  if (!results) return null;
+
+  const { total, processed, withActors, withIndicators, withoutActors, errors, scanTime } = results;
+
+  // Collect all unique actors found
+  const allActorsFound = {};
+  withActors.forEach(item => {
+    item.actors.forEach(actor => {
+      if (!allActorsFound[actor.actor_id]) {
+        allActorsFound[actor.actor_id] = {
+          ...actor,
+          detectionCount: 0,
+          detectionIds: []
+        };
+      }
+      allActorsFound[actor.actor_id].detectionCount++;
+      allActorsFound[actor.actor_id].detectionIds.push(item.detectionId);
+    });
+  });
+
+  const uniqueActors = Object.values(allActorsFound).sort((a, b) => b.detectionCount - a.detectionCount);
+
+  // Collect all unique indicators found
+  const allIndicatorsFound = {};
+  (withIndicators || []).forEach(item => {
+    (item.indicators || []).forEach(ind => {
+      const key = ind.indicator_value || ind.indicator_id;
+      if (!allIndicatorsFound[key]) {
+        allIndicatorsFound[key] = {
+          ...ind,
+          detectionCount: 0,
+          detectionIds: []
+        };
+      }
+      allIndicatorsFound[key].detectionCount++;
+      allIndicatorsFound[key].detectionIds.push(item.detectionId);
+    });
+  });
+
+  const uniqueIndicators = Object.values(allIndicatorsFound).sort((a, b) => b.detectionCount - a.detectionCount);
+
+  // Generate and download CSV report
+  const downloadReport = () => {
+    const lines = [];
+
+    // Header
+    lines.push('Threat Intelligence Correlation Report');
+    lines.push(`Scan Time: ${scanTime || new Date().toISOString()}`);
+    lines.push(`Total Detections Scanned: ${total}`);
+    lines.push(`Detections with Actors: ${withActors.length}`);
+    lines.push(`Detections with Indicators: ${(withIndicators || []).length}`);
+    lines.push(`Detections without Intel: ${withoutActors.length}`);
+    lines.push(`Errors: ${errors.length}`);
+    lines.push('');
+
+    // Unique Actors Summary
+    lines.push('=== THREAT ACTORS IDENTIFIED ===');
+    lines.push('Actor ID,Actor Name,Correlation Type,Confidence,Detection Count');
+    uniqueActors.forEach(actor => {
+      lines.push(`"${actor.actor_id}","${actor.actor_name}","${actor.correlation_type}",${Math.round(actor.confidence_score * 100)}%,${actor.detectionCount}`);
+    });
+    lines.push('');
+
+    // Unique Indicators Summary
+    lines.push('=== INTEL INDICATORS (IOCs) IDENTIFIED ===');
+    lines.push('Indicator Value,Indicator Type,Malware Family,Threat Type,Confidence,Detection Count');
+    uniqueIndicators.forEach(ind => {
+      const malwareFamily = (ind.malware_families || []).join('; ') || 'N/A';
+      const threatType = (ind.threat_types || []).join('; ') || 'N/A';
+      lines.push(`"${ind.indicator_value || ''}","${ind.indicator_type || ''}","${malwareFamily}","${threatType}",${ind.confidence || 0}%,${ind.detectionCount}`);
+    });
+    lines.push('');
+
+    // Detections with Actors
+    lines.push('=== DETECTIONS WITH ACTOR ATTRIBUTION ===');
+    lines.push('Detection ID,Actor ID,Actor Name,Correlation Type,Confidence');
+    withActors.forEach(item => {
+      item.actors.forEach(actor => {
+        lines.push(`"${item.detectionId}","${actor.actor_id}","${actor.actor_name}","${actor.correlation_type}",${Math.round(actor.confidence_score * 100)}%`);
+      });
+    });
+    lines.push('');
+
+    // Detections with Indicators
+    lines.push('=== DETECTIONS WITH INTEL INDICATORS ===');
+    lines.push('Detection ID,Indicator Value,Indicator Type,Malware Family,Confidence');
+    (withIndicators || []).forEach(item => {
+      (item.indicators || []).forEach(ind => {
+        const malwareFamily = (ind.malware_families || []).join('; ') || 'N/A';
+        lines.push(`"${item.detectionId}","${ind.indicator_value || ''}","${ind.indicator_type || ''}","${malwareFamily}",${ind.confidence || 0}%`);
+      });
+    });
+    lines.push('');
+
+    // Detections without Intel
+    lines.push('=== DETECTIONS WITHOUT THREAT INTEL ===');
+    lines.push('Detection ID');
+    withoutActors.forEach(item => {
+      lines.push(`"${item.detectionId}"`);
+    });
+
+    // Create and download file
+    const csv = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `threat-intel-report-${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-full max-w-3xl max-h-[85vh] overflow-y-auto">
+        <div className="flex justify-between items-start mb-4">
+          <div>
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white">Threat Intelligence Correlation Results</h2>
+            <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+              Processed {processed} of {total} detections
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        {/* Summary Stats */}
+        <div className="grid grid-cols-4 gap-4 mb-6">
+          <div className="bg-green-50 dark:bg-green-900/30 rounded-lg p-4 text-center">
+            <div className="text-3xl font-bold text-green-600 dark:text-green-400">{withActors.length}</div>
+            <div className="text-sm text-green-700 dark:text-green-300">With Actors</div>
+          </div>
+          <div className="bg-purple-50 dark:bg-purple-900/30 rounded-lg p-4 text-center">
+            <div className="text-3xl font-bold text-purple-600 dark:text-purple-400">{(withIndicators || []).length}</div>
+            <div className="text-sm text-purple-700 dark:text-purple-300">With Indicators</div>
+          </div>
+          <div className="bg-gray-50 dark:bg-gray-700 rounded-lg p-4 text-center">
+            <div className="text-3xl font-bold text-gray-600 dark:text-gray-300">{withoutActors.length}</div>
+            <div className="text-sm text-gray-500 dark:text-gray-400">No Intel Found</div>
+          </div>
+          <div className="bg-red-50 dark:bg-red-900/30 rounded-lg p-4 text-center">
+            <div className="text-3xl font-bold text-red-600 dark:text-red-400">{errors.length}</div>
+            <div className="text-sm text-red-700 dark:text-red-300">Errors</div>
+          </div>
+        </div>
+
+        {/* Unique Actors Found */}
+        {uniqueActors.length > 0 && (
+          <div className="mb-6">
+            <h3 className="font-semibold text-gray-800 dark:text-white mb-3 flex items-center">
+              <AlertTriangle className="w-5 h-5 mr-2 text-orange-500" />
+              Threat Actors Identified ({uniqueActors.length})
+            </h3>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {uniqueActors.map((actor) => (
+                <div
+                  key={actor.actor_id}
+                  className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-600 cursor-pointer"
+                  onClick={() => onViewActor(actor.actor_id)}
+                >
+                  <div className="flex items-center">
+                    <div className={`w-3 h-3 rounded-full mr-3 ${
+                      actor.correlation_type === 'native' ? 'bg-red-500' :
+                      actor.correlation_type === 'indicator_match' ? 'bg-orange-500' : 'bg-blue-500'
+                    }`} />
+                    <div>
+                      <div className="font-medium text-gray-900 dark:text-white">{actor.actor_name}</div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400">
+                        {actor.correlation_type} • {Math.round(actor.confidence_score * 100)}% confidence
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-lg font-semibold text-gray-700 dark:text-gray-300">{actor.detectionCount}</div>
+                    <div className="text-xs text-gray-500">detections</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Unique Indicators Found */}
+        {uniqueIndicators.length > 0 && (
+          <div className="mb-6">
+            <h3 className="font-semibold text-gray-800 dark:text-white mb-3 flex items-center">
+              <Shield className="w-5 h-5 mr-2 text-purple-500" />
+              Intel Indicators Identified ({uniqueIndicators.length})
+            </h3>
+            <div className="space-y-2 max-h-60 overflow-y-auto">
+              {uniqueIndicators.slice(0, 20).map((ind, idx) => (
+                <div
+                  key={idx}
+                  className="flex items-center justify-between p-3 bg-purple-50 dark:bg-purple-900/30 rounded-lg"
+                >
+                  <div className="flex items-center flex-1 min-w-0">
+                    <div className="w-3 h-3 rounded-full mr-3 bg-purple-500" />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium text-gray-900 dark:text-white truncate" title={ind.indicator_value}>
+                        {ind.malware_families?.length > 0 ? ind.malware_families[0] : ind.indicator_type}
+                      </div>
+                      <div className="text-xs text-gray-500 dark:text-gray-400 truncate">
+                        {ind.indicator_type} • {ind.threat_types?.[0] || 'Unknown'} • {ind.confidence}% confidence
+                      </div>
+                    </div>
+                  </div>
+                  <div className="text-right ml-2">
+                    <div className="text-lg font-semibold text-purple-700 dark:text-purple-300">{ind.detectionCount}</div>
+                    <div className="text-xs text-gray-500">detections</div>
+                  </div>
+                </div>
+              ))}
+              {uniqueIndicators.length > 20 && (
+                <div className="text-purple-500 dark:text-purple-400 text-center py-1 text-sm">
+                  ...and {uniqueIndicators.length - 20} more indicators
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Detections with Actors */}
+        {withActors.length > 0 && (
+          <div className="mb-6">
+            <h3 className="font-semibold text-gray-800 dark:text-white mb-3 flex items-center">
+              <CheckCircle className="w-5 h-5 mr-2 text-green-500" />
+              Detections with Actor Attribution ({withActors.length})
+            </h3>
+            <div className="space-y-1 max-h-40 overflow-y-auto text-sm">
+              {withActors.slice(0, 20).map((item) => (
+                <div key={item.detectionId} className="flex items-center justify-between py-1 px-2 bg-green-50 dark:bg-green-900/20 rounded">
+                  <span className="text-gray-700 dark:text-gray-300 truncate flex-1 mr-2" title={item.detectionId}>
+                    {item.detectionId.substring(0, 50)}...
+                  </span>
+                  <span className="text-green-600 dark:text-green-400 whitespace-nowrap">
+                    {item.actors.length} actor(s)
+                  </span>
+                </div>
+              ))}
+              {withActors.length > 20 && (
+                <div className="text-gray-500 dark:text-gray-400 text-center py-1">
+                  ...and {withActors.length - 20} more
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* No intel found message */}
+        {withActors.length === 0 && uniqueIndicators.length === 0 && (
+          <div className="mb-6 p-4 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg text-center">
+            <AlertCircle className="w-8 h-8 mx-auto mb-2 text-yellow-500" />
+            <p className="text-yellow-700 dark:text-yellow-300">
+              No threat actors or indicators were linked to the selected detections.
+            </p>
+            <p className="text-sm text-yellow-600 dark:text-yellow-400 mt-1">
+              This may be because the detections don't match known actor TTPs or indicators.
+            </p>
+          </div>
+        )}
+
+        {/* Action buttons */}
+        <div className="flex justify-between mt-4 pt-4 border-t dark:border-gray-700">
+          <button
+            onClick={downloadReport}
+            className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 flex items-center"
+          >
+            <Download className="w-4 h-4 mr-2" />
+            Download Report (CSV)
+          </button>
+          <button
+            onClick={onClose}
+            className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
+            Close
+          </button>
+        </div>
+      </div>
     </div>
   );
 };
@@ -4147,7 +6650,631 @@ const HelpSidebar = ({ activeTab, onClose, onChangeTab }) => {
   );
 };
 
+// Sensor Health Tab Component
+const SensorHealthTab = ({ showNotification }) => {
+  const [healthData, setHealthData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState(null);
 
+  const fetchHealthData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${API_BASE}/sensor-health`, { headers: getAuthHeaders() });
+      if (!response.ok) throw new Error('Failed to fetch sensor health');
+      const data = await response.json();
+      setHealthData(data);
+    } catch (err) {
+      showNotification(`Error fetching sensor health: ${err.message}`, 'error');
+    } finally {
+      setLoading(false);
+    }
+  }, [showNotification]);
+
+  useEffect(() => {
+    fetchHealthData();
+  }, [fetchHealthData]);
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'online': return 'bg-green-500';
+      case 'offline': return 'bg-red-500';
+      case 'stale': return 'bg-yellow-500';
+      case 'rfm': return 'bg-purple-500';
+      case 'contained': return 'bg-blue-500';
+      case 'outdated': return 'bg-orange-500';
+      default: return 'bg-gray-500';
+    }
+  };
+
+  const formatLastSeen = (lastSeen) => {
+    if (!lastSeen) return 'Never';
+    const date = new Date(lastSeen);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
+    const diffDays = Math.floor(diffHours / 24);
+
+    if (diffDays > 0) return `${diffDays}d ago`;
+    if (diffHours > 0) return `${diffHours}h ago`;
+    return 'Just now';
+  };
+
+  const StatCard = ({ title, value, color, icon: Icon, onClick, isSelected }) => (
+    <div
+      onClick={onClick}
+      className={`bg-white dark:bg-gray-800 rounded-lg p-4 cursor-pointer transition-all duration-200
+        border-2 ${isSelected
+          ? `${color.replace('text-', 'border-')} shadow-lg scale-105`
+          : 'border-gray-200 dark:border-gray-700 hover:border-gray-400 dark:hover:border-gray-500'}
+        hover:shadow-lg hover:scale-102`}
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-gray-500 dark:text-gray-400">{title}</p>
+          <p className={`text-2xl font-bold ${color}`}>{value}</p>
+        </div>
+        <div className={`w-12 h-12 rounded-full ${color.replace('text-', 'bg-').replace('-600', '-100')} dark:bg-opacity-20 flex items-center justify-center`}>
+          <Icon className={`w-6 h-6 ${color}`} />
+        </div>
+      </div>
+      <p className="text-xs text-gray-400 dark:text-gray-500 mt-2 text-center">Click to view</p>
+    </div>
+  );
+
+  if (loading && !healthData) {
+    return (
+      <div className="p-6 flex items-center justify-center">
+        <RefreshCw className="w-8 h-8 animate-spin text-gray-400" />
+        <span className="ml-2 text-gray-600 dark:text-gray-400">Loading sensor health data...</span>
+      </div>
+    );
+  }
+
+  if (!healthData) {
+    return (
+      <div className="p-6 text-center text-gray-500">
+        <AlertCircle className="w-12 h-12 mx-auto mb-2" />
+        <p>Failed to load sensor health data</p>
+        <button onClick={fetchHealthData} className="mt-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const { summary, latest_version, version_distribution, problem_hosts } = healthData;
+
+  const categories = [
+    { id: 'online', label: 'Online', count: summary.online, color: 'text-green-600', icon: CheckCircle, hosts: [] },
+    { id: 'offline', label: 'Offline (24h+)', count: summary.offline, color: 'text-red-600', icon: AlertTriangle, hosts: problem_hosts.offline },
+    { id: 'stale', label: 'Stale (7d+)', count: summary.stale_7d, color: 'text-yellow-600', icon: Clock, hosts: problem_hosts.stale },
+    { id: 'very_stale', label: 'Very Stale (30d+)', count: summary.stale_30d, color: 'text-orange-600', icon: AlertCircle, hosts: problem_hosts.very_stale },
+    { id: 'rfm', label: 'RFM Mode', count: summary.rfm, color: 'text-purple-600', icon: AlertTriangle, hosts: problem_hosts.rfm },
+    { id: 'contained', label: 'Contained', count: summary.contained, color: 'text-blue-600', icon: Shield, hosts: problem_hosts.contained },
+    { id: 'outdated', label: 'Outdated', count: summary.outdated, color: 'text-orange-600', icon: Download, hosts: problem_hosts.outdated },
+  ];
+
+  const selectedCategoryData = categories.find(c => c.id === selectedCategory);
+
+  return (
+    <div className="p-6">
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-xl font-bold text-gray-800 dark:text-white">Sensor Health Dashboard</h2>
+        <button
+          onClick={fetchHealthData}
+          disabled={loading}
+          className="flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+        >
+          <RefreshCw className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+
+      {/* Summary Stats */}
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-6">
+        {categories.map(cat => (
+          <StatCard
+            key={cat.id}
+            title={cat.label}
+            value={cat.count}
+            color={cat.color}
+            icon={cat.icon}
+            onClick={() => setSelectedCategory(selectedCategory === cat.id ? null : cat.id)}
+            isSelected={selectedCategory === cat.id}
+          />
+        ))}
+      </div>
+
+      {/* Overall Health Score */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+        <div className="bg-white dark:bg-gray-800 rounded-lg border-2 border-gray-200 dark:border-gray-700 p-6">
+          <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">Fleet Health Score</h3>
+          <div className="flex items-center">
+            <div className="relative w-32 h-32">
+              <svg className="w-32 h-32 transform -rotate-90">
+                <circle cx="64" cy="64" r="56" stroke="currentColor" strokeWidth="12" fill="none" className="text-gray-200 dark:text-gray-700" />
+                <circle
+                  cx="64" cy="64" r="56"
+                  stroke="currentColor"
+                  strokeWidth="12"
+                  fill="none"
+                  strokeDasharray={`${(summary.online / summary.total) * 352} 352`}
+                  className={summary.online / summary.total > 0.9 ? 'text-green-500' : summary.online / summary.total > 0.7 ? 'text-yellow-500' : 'text-red-500'}
+                />
+              </svg>
+              <div className="absolute inset-0 flex items-center justify-center">
+                <span className="text-2xl font-bold text-gray-800 dark:text-white">
+                  {summary.total > 0 ? Math.round((summary.online / summary.total) * 100) : 0}%
+                </span>
+              </div>
+            </div>
+            <div className="ml-6">
+              <p className="text-sm text-gray-500 dark:text-gray-400">Total Endpoints: <span className="font-semibold text-gray-800 dark:text-white">{summary.total.toLocaleString()}</span></p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">Healthy: <span className="font-semibold text-green-600">{summary.online.toLocaleString()}</span></p>
+              <p className="text-sm text-gray-500 dark:text-gray-400">Needs Attention: <span className="font-semibold text-red-600">{(summary.offline + summary.stale_7d + summary.rfm).toLocaleString()}</span></p>
+              <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">Latest Sensor: <span className="font-mono text-xs bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded">{latest_version || 'N/A'}</span></p>
+            </div>
+          </div>
+        </div>
+
+        {/* Version Distribution */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border-2 border-gray-200 dark:border-gray-700 p-6">
+          <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">Sensor Version Distribution</h3>
+          <div className="space-y-3 max-h-56 overflow-y-auto pr-4">
+            {version_distribution.map((v, idx) => (
+              <div key={idx} className="flex items-center">
+                <span className={`font-mono text-xs w-36 flex-shrink-0 ${v.is_latest ? 'text-green-600 font-semibold' : 'text-gray-600 dark:text-gray-400'}`}>
+                  {v.version} {v.is_latest && '(latest)'}
+                </span>
+                <div className="flex-1 mx-3">
+                  <div className="h-5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full ${v.is_latest ? 'bg-green-500' : 'bg-blue-500'}`}
+                      style={{ width: `${Math.max((v.count / summary.total) * 100, 1)}%` }}
+                    />
+                  </div>
+                </div>
+                <span className="text-sm font-medium text-gray-700 dark:text-gray-300 w-20 text-right flex-shrink-0">{v.count.toLocaleString()}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Problem Hosts Table */}
+      {selectedCategoryData && selectedCategoryData.hosts.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg shadow">
+          <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+            <h3 className="text-lg font-semibold text-gray-800 dark:text-white">
+              {selectedCategoryData.label} Hosts ({selectedCategoryData.hosts.length})
+            </h3>
+            <button onClick={() => setSelectedCategory(null)} className="text-gray-500 hover:text-gray-700">
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+              <thead className="bg-gray-50 dark:bg-gray-900">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Hostname</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Platform</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Agent Version</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Last Seen</th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+                </tr>
+              </thead>
+              <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
+                {selectedCategoryData.hosts.map((host, idx) => (
+                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">{host.hostname}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{host.platform}</td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-mono text-gray-500 dark:text-gray-400">
+                      {host.agent_version}
+                      {host.latest_version && host.agent_version !== host.latest_version && (
+                        <span className="ml-2 text-xs text-orange-600">→ {host.latest_version}</span>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">{formatLastSeen(host.last_seen)}</td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={`px-2 py-1 text-xs rounded-full ${
+                        host.status === 'contained' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                        host.status === 'normal' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                        'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-200'
+                      }`}>
+                        {host.status}
+                      </span>
+                      {host.rfm === 'yes' && (
+                        <span className="ml-2 px-2 py-1 text-xs rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200">RFM</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Quick Actions */}
+      <div className="mt-6 bg-white dark:bg-gray-800 rounded-lg shadow p-6">
+        <h3 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">Recommendations</h3>
+        <div className="space-y-3">
+          {summary.stale_30d > 0 && (
+            <div className="flex items-start p-3 bg-orange-50 dark:bg-orange-900/20 rounded-lg">
+              <AlertTriangle className="w-5 h-5 text-orange-600 mt-0.5 mr-3 flex-shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-orange-800 dark:text-orange-200">Very Stale Hosts Detected</p>
+                <p className="text-sm text-orange-700 dark:text-orange-300">{summary.stale_30d} hosts haven't checked in for 30+ days. Consider removing them from the console or investigating.</p>
+              </div>
+            </div>
+          )}
+          {summary.rfm > 0 && (
+            <div className="flex items-start p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg">
+              <AlertCircle className="w-5 h-5 text-purple-600 mt-0.5 mr-3 flex-shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-purple-800 dark:text-purple-200">Reduced Functionality Mode</p>
+                <p className="text-sm text-purple-700 dark:text-purple-300">{summary.rfm} hosts are in RFM mode with degraded protection. Check sensor logs and connectivity.</p>
+              </div>
+            </div>
+          )}
+          {summary.outdated > 10 && (
+            <div className="flex items-start p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">
+              <Download className="w-5 h-5 text-yellow-600 mt-0.5 mr-3 flex-shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">Sensor Updates Available</p>
+                <p className="text-sm text-yellow-700 dark:text-yellow-300">{summary.outdated} hosts are not on the latest sensor version ({latest_version}). Review sensor update policies.</p>
+              </div>
+            </div>
+          )}
+          {summary.online === summary.total && (
+            <div className="flex items-start p-3 bg-green-50 dark:bg-green-900/20 rounded-lg">
+              <CheckCircle className="w-5 h-5 text-green-600 mt-0.5 mr-3 flex-shrink-0" />
+              <div>
+                <p className="text-sm font-medium text-green-800 dark:text-green-200">All Systems Healthy</p>
+                <p className="text-sm text-green-700 dark:text-green-300">All {summary.total} endpoints are online and reporting normally.</p>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Sandbox Submit Dialog
+const SandboxSubmitDialog = ({ onClose, onSubmit }) => {
+  const [submitData, setSubmitData] = useState({
+    type: 'sha256',
+    value: '',
+    environment_id: 160,
+    network_settings: 'default',
+    command_line: '',
+    submit_name: '',
+  });
+
+  const handleSubmit = () => {
+    if (!submitData.value.trim()) return;
+
+    const payload = {
+      environment_id: submitData.environment_id,
+      network_settings: submitData.network_settings,
+    };
+
+    if (submitData.type === 'sha256') {
+      payload.sha256 = submitData.value.trim();
+    } else {
+      payload.url = submitData.value.trim();
+    }
+
+    if (submitData.command_line.trim()) {
+      payload.command_line = submitData.command_line.trim();
+    }
+    if (submitData.submit_name.trim()) {
+      payload.submit_name = submitData.submit_name.trim();
+    }
+
+    onSubmit(payload);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 max-w-lg w-full mx-4">
+        <div className="flex justify-between items-center mb-4">
+          <h3 className="text-xl font-bold text-gray-800 dark:text-white">Submit to Sandbox</h3>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        <div className="space-y-4">
+          {/* Type selector */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Submission Type
+            </label>
+            <select
+              value={submitData.type}
+              onChange={(e) => setSubmitData({ ...submitData, type: e.target.value, value: '' })}
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="sha256">SHA256 Hash (file already in Falcon)</option>
+              <option value="url">URL</option>
+            </select>
+          </div>
+
+          {/* Value input */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              {submitData.type === 'sha256' ? 'SHA256 Hash' : 'URL'}
+            </label>
+            <input
+              type="text"
+              value={submitData.value}
+              onChange={(e) => setSubmitData({ ...submitData, value: e.target.value })}
+              placeholder={submitData.type === 'sha256' ? 'Enter SHA256 hash...' : 'https://example.com/file.exe'}
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono text-sm"
+            />
+          </div>
+
+          {/* Environment selector */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Analysis Environment
+            </label>
+            <select
+              value={submitData.environment_id}
+              onChange={(e) => setSubmitData({ ...submitData, environment_id: parseInt(e.target.value) })}
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value={160}>Windows 10 64-bit</option>
+              <option value={110}>Windows 7 64-bit</option>
+              <option value={100}>Windows 7 32-bit</option>
+              <option value={300}>Linux Ubuntu 16.04 64-bit</option>
+              <option value={200}>Android</option>
+            </select>
+          </div>
+
+          {/* Network settings */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Network Settings
+            </label>
+            <select
+              value={submitData.network_settings}
+              onChange={(e) => setSubmitData({ ...submitData, network_settings: e.target.value })}
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            >
+              <option value="default">Default (Internet access)</option>
+              <option value="tor">Tor Network</option>
+              <option value="simulated">Simulated Internet</option>
+              <option value="offline">Offline</option>
+            </select>
+          </div>
+
+          {/* Optional: Command line */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Command Line Arguments (optional)
+            </label>
+            <input
+              type="text"
+              value={submitData.command_line}
+              onChange={(e) => setSubmitData({ ...submitData, command_line: e.target.value })}
+              placeholder="e.g., /silent /install"
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
+
+          {/* Optional: Custom name */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Custom Name (optional)
+            </label>
+            <input
+              type="text"
+              value={submitData.submit_name}
+              onChange={(e) => setSubmitData({ ...submitData, submit_name: e.target.value })}
+              placeholder="e.g., Q1 Phishing Sample"
+              className="w-full px-4 py-2 border dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+            />
+          </div>
+        </div>
+
+        <div className="flex justify-end space-x-2 mt-6">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleSubmit}
+            disabled={!submitData.value.trim()}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            Submit for Analysis
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Sandbox Report Dialog
+const SandboxReportDialog = ({ report, onClose }) => {
+  const getVerdictColor = (verdict) => {
+    switch (verdict?.toLowerCase()) {
+      case 'malicious': return 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200';
+      case 'suspicious': return 'bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200';
+      case 'no specific threat': return 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200';
+      default: return 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-200';
+    }
+  };
+
+  const getThreatScoreColor = (score) => {
+    if (score >= 80) return 'text-red-600 dark:text-red-400';
+    if (score >= 50) return 'text-orange-600 dark:text-orange-400';
+    if (score >= 20) return 'text-yellow-600 dark:text-yellow-400';
+    return 'text-green-600 dark:text-green-400';
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-lg w-full max-w-4xl max-h-[90vh] flex flex-col">
+        {/* Header */}
+        <div className="flex justify-between items-center p-6 border-b dark:border-gray-700">
+          <div>
+            <h3 className="text-xl font-bold text-gray-800 dark:text-white">Sandbox Analysis Report</h3>
+            {report.submit_name && (
+              <p className="text-sm text-gray-600 dark:text-gray-400">{report.submit_name}</p>
+            )}
+          </div>
+          <button onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="flex-1 overflow-y-auto p-6">
+          {/* Summary */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+            <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
+              <p className="text-xs text-gray-500 dark:text-gray-400 uppercase">Verdict</p>
+              <span className={`inline-block mt-1 px-3 py-1 rounded-full text-sm font-semibold ${getVerdictColor(report.verdict)}`}>
+                {report.verdict || 'Unknown'}
+              </span>
+            </div>
+            <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
+              <p className="text-xs text-gray-500 dark:text-gray-400 uppercase">Threat Score</p>
+              <p className={`text-2xl font-bold ${getThreatScoreColor(report.threat_score)}`}>
+                {report.threat_score ?? 'N/A'}
+              </p>
+            </div>
+            <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
+              <p className="text-xs text-gray-500 dark:text-gray-400 uppercase">File Type</p>
+              <p className="text-sm font-medium text-gray-800 dark:text-white mt-1">{report.file_type || 'N/A'}</p>
+            </div>
+            <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
+              <p className="text-xs text-gray-500 dark:text-gray-400 uppercase">Environment</p>
+              <p className="text-sm font-medium text-gray-800 dark:text-white mt-1">{report.environment_description || 'N/A'}</p>
+            </div>
+          </div>
+
+          {/* SHA256 */}
+          {report.sha256 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">SHA256</h4>
+              <p className="font-mono text-xs bg-gray-100 dark:bg-gray-900 p-2 rounded break-all text-gray-800 dark:text-gray-200">
+                {report.sha256}
+              </p>
+            </div>
+          )}
+
+          {/* MITRE ATT&CK */}
+          {report.mitre_attacks && report.mitre_attacks.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">MITRE ATT&CK Techniques</h4>
+              <div className="flex flex-wrap gap-2">
+                {report.mitre_attacks.map((attack, idx) => (
+                  <span key={idx} className="px-2 py-1 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-200 rounded text-xs">
+                    {attack.technique_id || attack.attack_id}: {attack.technique || attack.attack_id_wiki}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Signatures */}
+          {report.signatures && report.signatures.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Signatures ({report.signatures.length})</h4>
+              <div className="space-y-2 max-h-40 overflow-y-auto">
+                {report.signatures.map((sig, idx) => (
+                  <div key={idx} className="text-sm bg-gray-50 dark:bg-gray-900 p-2 rounded">
+                    <span className="font-medium text-gray-800 dark:text-gray-200">{sig.name || sig}</span>
+                    {sig.description && <p className="text-xs text-gray-600 dark:text-gray-400">{sig.description}</p>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* DNS Requests */}
+          {report.dns_requests && report.dns_requests.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">DNS Requests ({report.dns_requests.length})</h4>
+              <div className="space-y-1 max-h-32 overflow-y-auto">
+                {report.dns_requests.map((dns, idx) => (
+                  <p key={idx} className="text-xs font-mono bg-gray-50 dark:bg-gray-900 p-1 rounded text-gray-800 dark:text-gray-200">
+                    {dns.domain || dns}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Contacted Hosts */}
+          {report.contacted_hosts && report.contacted_hosts.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Contacted Hosts ({report.contacted_hosts.length})</h4>
+              <div className="space-y-1 max-h-32 overflow-y-auto">
+                {report.contacted_hosts.map((host, idx) => (
+                  <p key={idx} className="text-xs font-mono bg-gray-50 dark:bg-gray-900 p-1 rounded text-gray-800 dark:text-gray-200">
+                    {host.address || host.ip || host}:{host.port || 'N/A'}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Processes */}
+          {report.processes && report.processes.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Processes ({report.processes.length})</h4>
+              <div className="space-y-2 max-h-40 overflow-y-auto">
+                {report.processes.slice(0, 20).map((proc, idx) => (
+                  <div key={idx} className="text-xs bg-gray-50 dark:bg-gray-900 p-2 rounded">
+                    <p className="font-medium text-gray-800 dark:text-gray-200">{proc.name || proc.process_name}</p>
+                    {proc.command_line && (
+                      <p className="font-mono text-gray-600 dark:text-gray-400 break-all">{proc.command_line}</p>
+                    )}
+                  </div>
+                ))}
+                {report.processes.length > 20 && (
+                  <p className="text-xs text-gray-500">...and {report.processes.length - 20} more</p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Extracted Files */}
+          {report.extracted_files && report.extracted_files.length > 0 && (
+            <div className="mb-6">
+              <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Extracted Files ({report.extracted_files.length})</h4>
+              <div className="space-y-1 max-h-32 overflow-y-auto">
+                {report.extracted_files.map((file, idx) => (
+                  <p key={idx} className="text-xs font-mono bg-gray-50 dark:bg-gray-900 p-1 rounded text-gray-800 dark:text-gray-200">
+                    {file.name || file.filename || file}
+                  </p>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-end p-6 border-t dark:border-gray-700">
+          <button
+            onClick={onClose}
+            className="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 // Export statement at the end of your App.js file
 export default FalconDashboard;

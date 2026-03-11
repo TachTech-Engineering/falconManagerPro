@@ -499,6 +499,28 @@ class DetectionDAO:
             
             return len(detections)
 
+    def get_by_id(self, tenant_id: str, detection_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single detection by ID"""
+        with self.db.get_cursor(commit=False) as cursor:
+            cursor.execute("""
+                SELECT
+                    detection_id,
+                    severity,
+                    status,
+                    timestamp,
+                    host_name,
+                    host_id,
+                    tactic,
+                    technique,
+                    description,
+                    has_hash,
+                    raw_data,
+                    first_seen
+                FROM detections
+                WHERE tenant_id = %s AND detection_id = %s
+            """, (tenant_id, detection_id))
+            return cursor.fetchone()
+
     def get_by_tenant(self, tenant_id: str, hours: int = 24, severity: str = None, status: str = None, limit: int = 5000) -> List[Dict[str, Any]]:
         """Get detections from database with filtering"""
         with self.db.get_cursor(commit=False) as cursor:

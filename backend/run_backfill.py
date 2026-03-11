@@ -181,9 +181,10 @@ def run_backfill():
                 if start_utc_env and end_utc_env:
                     logger.info(f"Using explicit backfill window: {start_utc_env} → {end_utc_env}")
                     # CrowdStrike expects naive UTC timestamps
+                    # Use updated_timestamp to capture status changes
                     filter_str = (
-                        f"created_timestamp:>='{start_utc_env}',"
-                        f"created_timestamp:<'{end_utc_env}'"
+                        f"updated_timestamp:>='{start_utc_env}',"
+                        f"updated_timestamp:<'{end_utc_env}'"
                     )
                 else:
                     # Default 30-day window
@@ -192,18 +193,19 @@ def run_backfill():
                     # Remove timezone for CrowdStrike API
                     start_naive = start_time.replace(tzinfo=None)
                     logger.info(f"Using default 30-day window: since {start_naive.isoformat()}Z")
-                    filter_str = f"created_timestamp:>='{start_naive.isoformat()}Z'"
-                
+                    # Use updated_timestamp to capture status changes
+                    filter_str = f"updated_timestamp:>='{start_naive.isoformat()}Z'"
+
                 # Query all detection IDs with pagination
                 all_ids = []
                 offset = None
-                
+
                 logger.info("Querying detection IDs from CrowdStrike...")
                 while True:
                     query = alerts.query_alerts(
                         filter=filter_str,
                         limit=5000,
-                        sort="created_timestamp.asc",
+                        sort="updated_timestamp.asc",
                         offset=offset
                     )
                     

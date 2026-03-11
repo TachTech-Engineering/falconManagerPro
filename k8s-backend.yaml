@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: falcon-api
-          image: us-central1-docker.pkg.dev/falconmanagerpro/falcon-manager/falcon-api:v1
+          image: us-central1-docker.pkg.dev/falconmanagerpro/falcon-manager/falcon-api:v7
           imagePullPolicy: Always
           ports:
             - containerPort: 5003
