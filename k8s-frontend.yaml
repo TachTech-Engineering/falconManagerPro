@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: falcon-ui
-          image: us-central1-docker.pkg.dev/falconmanagerpro/app-repo/falcon-ui:v34
+          image: us-central1-docker.pkg.dev/falconmanagerpro/app-repo/falcon-ui:v35
           imagePullPolicy: Always
           ports:
             - containerPort: 80
