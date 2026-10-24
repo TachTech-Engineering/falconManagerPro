@@ -28,6 +28,9 @@ metadata:
   name: falcon-ui
   labels:
     app: falcon-ui
+  annotations:
+    # Container-native LB (NEG) so the Ingress can reach a ClusterIP service
+    cloud.google.com/neg: '{"ingress": true}'
 spec:
   selector:
     app: falcon-ui
@@ -35,4 +38,5 @@ spec:
     - name: http
       port: 80
       targetPort: 80
-  type: LoadBalancer
+  # Internal only; public traffic must come through falcon-ingress (TLS via Cloudflare)
+  type: ClusterIP

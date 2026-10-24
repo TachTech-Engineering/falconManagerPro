@@ -24,10 +24,6 @@ echo "Step 3: Checking Ingress status..."
 kubectl get ingress falcon-ingress
 
 echo ""
-echo "Step 4: Checking ManagedCertificate status..."
-kubectl get managedcertificate falcon-managed-cert
-
-echo ""
 echo "=== Deployment Commands Completed ==="
 echo ""
 echo "IMPORTANT NEXT STEPS:"
@@ -44,6 +40,6 @@ echo "4. Enable Full (Strict) TLS in Cloudflare:"
 echo "   - Go to SSL/TLS > Overview"
 echo "   - Select 'Full (strict)'"
 echo ""
-echo "5. Monitor certificate provisioning:"
-echo "   kubectl describe managedcertificate falcon-managed-cert"
+echo "5. Verify the origin serves HTTPS only (port 80 should refuse/reset):"
+echo "   curl -I -H 'Host: falconmanagerpro.com' http://<LOAD_BALANCER_IP>"
 echo ""

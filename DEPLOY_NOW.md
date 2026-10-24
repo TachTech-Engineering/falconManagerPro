@@ -1,5 +1,9 @@
 # URGENT: Deploy Origin Certificate to Fix SSL Error
 
+> **Historical (completed).** The Ingress cutover is done, and on 2026-10-23 the old
+> LoadBalancer (35.184.54.110) was removed and the Ingress was made HTTPS-only.
+> See `CLOUDFLARE_TLS_SETUP.md` for the current setup.
+
 ## Current Problem
 
 **SSL Handshake Failed** because:

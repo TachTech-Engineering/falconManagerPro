@@ -85,7 +85,6 @@ kubectl apply -f k8s-ingress.yaml
 
 # Check status
 kubectl get ingress falcon-ingress
-kubectl get managedcertificate falcon-managed-cert
 ```
 
 ### Step 4: Wait for Load Balancer Provisioning
@@ -118,7 +117,7 @@ Expected output:
    | A | `@` | `136.110.230.236` | Proxied (🟠) | Auto |
    | A | `www` | `136.110.230.236` | Proxied (🟠) | Auto |
 
-5. **Delete any existing records** pointing to the old IP (35.184.54.110)
+5. **Delete any existing records** pointing to other IPs (the old LoadBalancer IP 35.184.54.110 was released on 2026-10-23)
 
 ### Step 6: Enable Full (Strict) TLS in Cloudflare
 
@@ -188,25 +187,20 @@ Look for:
 - `Default backend: 404 Not Found`
 - Events showing successful creation
 
-### Check ManagedCertificate Status
+### Check the Certificate Served by the Origin
 
 ```bash
-kubectl describe managedcertificate falcon-managed-cert
+echo | openssl s_client -connect 136.110.230.236:443 -servername falconmanagerpro.com 2>/dev/null \
+  | openssl x509 -noout -issuer -enddate
 ```
 
-Expected status after DNS propagation:
-```
-Status:
-  Certificate Name: mcrt-xxxxx
-  Certificate Status: Active
-  Domain Status:
-    Domain: falconmanagerpro.com
-    Status: Active
-    Domain: www.falconmanagerpro.com
-    Status: Active
-```
+Expected: issuer `CloudFlare Origin SSL Certificate Authority`, `notAfter=Nov 20 15:10:00 2040 GMT`.
 
-**If status is "Provisioning"**: Wait for DNS to propagate (can take up to 24 hours)
+> **Do not add a GCP `ManagedCertificate`.** Google can't validate the domain while it is
+> proxied through Cloudflare, so it fails permanently. Worse, the controller keeps every
+> failed `mcrt-*` cert attached via the `ingress.gcp.kubernetes.io/pre-shared-cert`
+> annotation; once that passed 15 certs, every Ingress sync failed
+> (`At most 15 SSL certificate(s) ... in TargetHttpsProxy`). It was removed on 2026-10-23.
 
 ### Check Services
 
@@ -216,7 +210,19 @@ kubectl get services
 
 Verify:
 - `falcon-api` (ClusterIP on 5003)
-- `falcon-ui` (can remain LoadBalancer or change to ClusterIP after Ingress works)
+- `falcon-ui` (ClusterIP on 80, with `cloud.google.com/neg: '{"ingress": true}'`)
+
+Neither service may be `type: LoadBalancer` — that gives it its own public IP that bypasses
+Cloudflare and TLS. Without the NEG annotation, the GCE Ingress needs a NodePort and a
+ClusterIP service will drop out of the load balancer.
+
+### Check Ingress Sync Errors
+
+```bash
+kubectl get events --field-selector involvedObject.name=falcon-ingress,type=Warning --sort-by=.lastTimestamp
+```
+
+Warnings here mean changes to `k8s-ingress.yaml` are not reaching GCP, even if the site still works.
 
 ### Common Issues
 
@@ -249,22 +255,20 @@ kubectl get pods -n kube-system | grep ingress
 
 ## Architecture Details
 
-### Current Setup (Before Ingress)
+### Current Setup
 
 ```
-User → Cloudflare → LoadBalancer (35.184.54.110) → falcon-ui:80 → nginx → falcon-api:5003
-                    [No TLS]
-```
-
-### New Setup (After Ingress)
-
-```
-User → Cloudflare → Ingress (136.110.230.236) → Services
+User → Cloudflare → Ingress (136.110.230.236, port 443 only) → NEG backends
      [TLS]          [TLS with origin cert]
                          ↓
-                    falcon-ui:80 (frontend)
-                    falcon-api:5003 (backend)
+                    falcon-ui:80 (frontend, ClusterIP)
+                    falcon-api:5003 (backend, ClusterIP)
 ```
+
+The Ingress has `kubernetes.io/ingress.allow-http: "false"`, so there is no port-80
+listener at the origin. HTTP→HTTPS redirects happen at Cloudflare ("Always Use HTTPS").
+This requires Cloudflare's SSL/TLS mode to stay on **Full (strict)** — "Flexible" connects
+to the origin over HTTP and would take the site down.
 
 ### Path Routing
 
@@ -301,37 +305,30 @@ User → Cloudflare → Ingress (136.110.230.236) → Services
 
 ---
 
-## Cleanup Old Resources (After Verification)
+## Cleanup Old Resources (Done 2026-10-23)
 
-Once the new Ingress is working, you can clean up:
+The old `falcon-ui` LoadBalancer was still serving the site over plain HTTP at
+35.184.54.110, bypassing Cloudflare. It was removed in this order to avoid downtime:
 
 ```bash
-# Optional: Change falcon-ui service from LoadBalancer to ClusterIP
-kubectl patch service falcon-ui -p '{"spec":{"type":"ClusterIP"}}'
-
-# This will release the old IP: 35.184.54.110
+# 1. Move the Ingress backend for falcon-ui to a NEG (wait until it reports HEALTHY)
+kubectl annotate svc falcon-ui 'cloud.google.com/neg={"ingress": true}'
+# 2. Switch to ClusterIP (released 35.184.54.110)
+kubectl apply -f k8s-frontend.yaml
+# 3. HTTPS-only Ingress, drop the failed ManagedCertificate and its stale certs
+kubectl apply -f k8s-ingress.yaml
+kubectl delete managedcertificate falcon-managed-cert
+kubectl annotate ingress falcon-ingress ingress.gcp.kubernetes.io/pre-shared-cert-
 ```
 
 ---
 
 ## Rollback Plan
 
-If something goes wrong:
-
-```bash
-# Delete ingress
-kubectl delete ingress falcon-ingress
-
-# Delete managed certificate
-kubectl delete managedcertificate falcon-managed-cert
-
-# Keep the secret (doesn't hurt to keep it)
-# kubectl delete secret cloudflare-origin-cert
-
-# In Cloudflare: Point DNS back to old IP
-# A record @ → 35.184.54.110
-# A record www → 35.184.54.110
-```
+The old LoadBalancer IP has been released, so there is no fallback origin. If the site
+breaks after an Ingress change, check the sync warnings above and re-apply the last
+known-good `k8s-ingress.yaml` / `k8s-frontend.yaml` from git. If Cloudflare reports
+SSL handshake or 521 errors, confirm the SSL/TLS mode is still **Full (strict)**.
 
 ---
 
@@ -383,7 +380,9 @@ notAfter=Nov 20 15:10:00 2040 GMT
 After deployment, verify:
 
 - [ ] Ingress has IP address (136.110.230.236)
-- [ ] ManagedCertificate status is "Active"
+- [ ] No Warning events on `falcon-ingress`
+- [ ] `curl -I -H 'Host: falconmanagerpro.com' http://136.110.230.236` is refused/reset (no HTTP at origin)
+- [ ] No service in `kubectl get svc` has an EXTERNAL-IP
 - [ ] Cloudflare DNS points to ingress IP
 - [ ] Cloudflare SSL/TLS mode set to "Full (strict)"
 - [ ] https://falconmanagerpro.com loads correctly
@@ -391,11 +390,11 @@ After deployment, verify:
 - [ ] API endpoint works: https://falconmanagerpro.com/api/health
 - [ ] Browser shows secure padlock
 - [ ] No certificate warnings
-- [ ] HTTP redirects to HTTPS (if enabled)
+- [ ] http://falconmanagerpro.com redirects to HTTPS (Cloudflare)
 
 ---
 
-**Last Updated:** 2025-11-24
+**Last Updated:** 2026-10-23
 **Project:** falconmanagerpro
 **GKE Cluster:** falcon-autopilot (us-central1)
 **Domain:** falconmanagerpro.com
