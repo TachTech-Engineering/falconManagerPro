@@ -1278,7 +1278,7 @@ kubectl get all
 kubectl describe ingress falcon-ingress
 
 # Check TLS certificates
-kubectl describe managedcertificate falcon-managed-cert
+kubectl get secret cloudflare-origin-cert -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -issuer -enddate
 openssl s_client -connect falconmanagerpro.com:443 -servername falconmanagerpro.com
 
 # Database diagnostics
