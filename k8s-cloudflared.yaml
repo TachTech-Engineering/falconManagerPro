@@ -1,0 +1,119 @@
+# Outbound-only Cloudflare Tunnel. No inbound ports are needed.
+# Ingress rules live in the ConfigMap below (the tunnel is locally managed, so
+# routes added in the Cloudflare dashboard are ignored).
+# Create the credentials secret once (derived from the tunnel token):
+#   kubectl create secret generic cloudflared-creds --from-file=credentials.json=<file>
+#   (credentials.json = {"AccountTag":..., "TunnelSecret":..., "TunnelID":...})
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+data:
+  config.yaml: |
+    tunnel: dfde274c-b45a-4719-b43a-0224dd102659
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    ingress:
+      - hostname: falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - hostname: www.falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: www.falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - hostname: tunnel-test.falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: tunnel-test.falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - service: http_status:404
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  labels:
+    app: cloudflared
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cloudflared
+      volumes:
+        - name: config
+          configMap:
+            name: cloudflared-config
+        - name: creds
+          secret:
+            secretName: cloudflared-creds
+      containers:
+        - name: cloudflared
+          image: cloudflare/cloudflared:2026.10.5
+          args:
+            - tunnel
+            - --config
+            - /etc/cloudflared/config/config.yaml
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cloudflared/config
+              readOnly: true
+            - name: creds
+              mountPath: /etc/cloudflared/creds
+              readOnly: true
+          ports:
+            - containerPort: 2000
+              name: metrics
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 2000
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: cloudflared
