@@ -28,10 +28,6 @@ metadata:
   name: falcon-ui
   labels:
     app: falcon-ui
-  annotations:
-    # Container-native LB (NEG) so the Ingress can reach a ClusterIP service
-    cloud.google.com/neg: '{"ingress": true}'
-    cloud.google.com/backend-config: '{"default": "falcon-cloudflare-only"}'
 spec:
   selector:
     app: falcon-ui

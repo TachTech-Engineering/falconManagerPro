@@ -1,9 +1,0 @@
-# Cloud Armor: only Cloudflare IP ranges may reach the LB backends.
-# Policy: falcon-cloudflare-only (project falconmanagerpro); refresh ranges from https://www.cloudflare.com/ips
-apiVersion: cloud.google.com/v1
-kind: BackendConfig
-metadata:
-  name: falcon-cloudflare-only
-spec:
-  securityPolicy:
-    name: falcon-cloudflare-only
