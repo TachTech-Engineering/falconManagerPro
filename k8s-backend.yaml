@@ -46,6 +46,13 @@ spec:
                   name: falcon-db-secret
                   key: DB_PASSWORD
 
+            # Fernet key(s) for tenant credential encryption (comma-separated; first key encrypts)
+            - name: TENANT_ENCRYPTION_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: tenant-encryption-keys
+                  key: TENANT_ENCRYPTION_KEYS
+
           livenessProbe:
             httpGet:
               path: /api/health

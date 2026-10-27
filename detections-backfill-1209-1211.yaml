@@ -17,6 +17,11 @@ spec:
         - secretRef:
             name: falcon-db-secret
         env:
+        - name: TENANT_ENCRYPTION_KEYS
+          valueFrom:
+            secretKeyRef:
+              name: tenant-encryption-keys
+              key: TENANT_ENCRYPTION_KEYS
         - name: BACKFILL_START_UTC
           value: "2025-12-09T00:00:00Z"
         - name: BACKFILL_END_UTC

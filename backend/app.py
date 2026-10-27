@@ -29,6 +29,7 @@ from email.message import EmailMessage
 # Import database components
 try:
     from database import db, tenant_dao, playbook_dao, execution_dao, ioc_dao, detection_dao, detection_dao
+    from secrets_crypto import decrypt_secret
     DB_ENABLED = True
     logging.info("✅ Database module loaded successfully")
 except Exception as e:
@@ -577,7 +578,7 @@ def auto_execute_playbooks():
             tenant_id = tenant['id']
             tenant_name = tenant['name']
             client_id = tenant['crowdstrike_client_id']
-            client_secret = tenant['crowdstrike_client_secret']
+            client_secret = decrypt_secret(tenant['crowdstrike_client_secret'])
             base_url = tenant['crowdstrike_base_url']
             
             try:
@@ -1018,7 +1019,7 @@ def sync_detections_to_database():
             tenant_id = tenant['id']
             tenant_name = tenant['name']
             client_id = tenant['crowdstrike_client_id']
-            client_secret = tenant['crowdstrike_client_secret']
+            client_secret = decrypt_secret(tenant['crowdstrike_client_secret'])
             base_url = tenant['crowdstrike_base_url']
             
             try:
@@ -1199,7 +1200,7 @@ def backfill_detections_30_days():
         try:
             tenant_id = tenant.get("id") if isinstance(tenant, dict) else tenant[0]
             client_id = tenant.get("crowdstrike_client_id") if isinstance(tenant, dict) else tenant[1]
-            client_secret = tenant.get("crowdstrike_client_secret") if isinstance(tenant, dict) else tenant[2]
+            client_secret = decrypt_secret(tenant.get("crowdstrike_client_secret") if isinstance(tenant, dict) else tenant[2])
             base_url = tenant.get("crowdstrike_base_url") if isinstance(tenant, dict) else tenant[3]
         except Exception as e:
             logger.exception(f"[Backfill] Could not parse tenant row: {tenant} | err={e}")
