@@ -32,8 +32,7 @@ spec:
               app: cloudflared
       containers:
         - name: cloudflared
-          # Pin to a current release before deploying
-          image: cloudflare/cloudflared:2024.12.2
+          image: cloudflare/cloudflared:2026.10.5
           args:
             - tunnel
             - --no-autoupdate
