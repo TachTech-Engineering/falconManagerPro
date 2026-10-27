@@ -7,6 +7,8 @@ import json
 from typing import List, Dict, Optional, Any
 import logging
 
+from secrets_crypto import SECRET_FIELDS, encrypt_secret, decrypt_secret
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,17 @@ class Database:
             conn.close()
 
 
+def _decrypt_tenant(row):
+    """Return a copy of a tenant row with secret columns decrypted"""
+    if not row:
+        return row
+    row = dict(row)
+    for field in SECRET_FIELDS:
+        if field in row:
+            row[field] = decrypt_secret(row[field])
+    return row
+
+
 class TenantDAO:
     """Data Access Object for Tenants"""
     
@@ -64,7 +77,7 @@ class TenantDAO:
                   AND is_active = true 
                   AND deleted_at IS NULL
             """, (api_key,))
-            return cursor.fetchone()
+            return _decrypt_tenant(cursor.fetchone())
     
     def get_by_id(self, tenant_id: str) -> Optional[Dict[str, Any]]:
         """Get tenant by ID"""
@@ -75,7 +88,7 @@ class TenantDAO:
                   AND is_active = true 
                   AND deleted_at IS NULL
             """, (tenant_id,))
-            return cursor.fetchone()
+            return _decrypt_tenant(cursor.fetchone())
     
     def get_by_domain(self, domain: str) -> Optional[Dict[str, Any]]:
         """Get tenant by domain"""
@@ -86,7 +99,7 @@ class TenantDAO:
                   AND is_active = true 
                   AND deleted_at IS NULL
             """, (domain,))
-            return cursor.fetchone()
+            return _decrypt_tenant(cursor.fetchone())
     
     def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new tenant"""
@@ -104,14 +117,14 @@ class TenantDAO:
                 data['domain'],
                 data['api_key'],
                 data.get('crowdstrike_client_id'),
-                data.get('crowdstrike_client_secret'),
+                encrypt_secret(data.get('crowdstrike_client_secret')),
                 data.get('crowdstrike_base_url', 'https://api.crowdstrike.com'),
-                data.get('virustotal_api_key'),
+                encrypt_secret(data.get('virustotal_api_key')),
                 data.get('plan', 'free'),
                 data.get('max_users', 5),
                 data.get('max_playbooks', 10)
             ))
-            return cursor.fetchone()
+            return _decrypt_tenant(cursor.fetchone())
     
     def update(self, tenant_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Update tenant"""
@@ -121,7 +134,7 @@ class TenantDAO:
         for key, value in data.items():
             if key not in ['id', 'created_at', 'updated_at', 'deleted_at']:
                 fields.append(f"{key} = %s")
-                values.append(value)
+                values.append(encrypt_secret(value) if key in SECRET_FIELDS else value)
         
         values.append(tenant_id)
         
@@ -132,7 +145,7 @@ class TenantDAO:
                 WHERE id = %s
                 RETURNING *
             """, values)
-            return cursor.fetchone()
+            return _decrypt_tenant(cursor.fetchone())
 
 
 class PlaybookDAO:

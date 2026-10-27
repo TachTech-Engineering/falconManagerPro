@@ -25,6 +25,7 @@ def run_backfill():
     try:
         # Import after environment is loaded
         from database import db, tenant_dao, detection_dao
+        from secrets_crypto import decrypt_secret
         from falconpy import OAuth2, Alerts
         
         logger.info("=" * 80)
@@ -146,13 +147,13 @@ def run_backfill():
                 tenant_id = tenant['id']
                 tenant_name = tenant['name']
                 client_id = tenant['crowdstrike_client_id']
-                client_secret = tenant['crowdstrike_client_secret']
+                client_secret = decrypt_secret(tenant['crowdstrike_client_secret'])
                 base_url = tenant['crowdstrike_base_url']
             else:
                 tenant_id = tenant[0]
                 tenant_name = tenant[1]
                 client_id = tenant[2]
-                client_secret = tenant[3]
+                client_secret = decrypt_secret(tenant[3])
                 base_url = tenant[4]
             
             logger.info("-" * 80)
