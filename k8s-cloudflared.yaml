@@ -1,9 +1,35 @@
-# Outbound-only Cloudflare Tunnel (remote-managed). No inbound ports are needed.
-# Create the secret first (token from Zero Trust > Networks > Tunnels):
-#   kubectl create secret generic cloudflared-token --from-literal=token=<TUNNEL_TOKEN>
-# Public hostname routes are configured in the Cloudflare dashboard:
-#   falconmanagerpro.com  path ^/api/  -> http://falcon-api.default.svc.cluster.local:5003
-#   falconmanagerpro.com  (catch-all)  -> http://falcon-ui.default.svc.cluster.local:80
+# Outbound-only Cloudflare Tunnel. No inbound ports are needed.
+# Ingress rules live in the ConfigMap below (the tunnel is locally managed, so
+# routes added in the Cloudflare dashboard are ignored).
+# Create the credentials secret once (derived from the tunnel token):
+#   kubectl create secret generic cloudflared-creds --from-file=credentials.json=<file>
+#   (credentials.json = {"AccountTag":..., "TunnelSecret":..., "TunnelID":...})
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+data:
+  config.yaml: |
+    tunnel: dfde274c-b45a-4719-b43a-0224dd102659
+    credentials-file: /etc/cloudflared/creds/credentials.json
+    ingress:
+      - hostname: falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - hostname: www.falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: www.falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - hostname: tunnel-test.falconmanagerpro.com
+        path: ^/api/
+        service: http://falcon-api.default.svc.cluster.local:5003
+      - hostname: tunnel-test.falconmanagerpro.com
+        service: http://falcon-ui.default.svc.cluster.local:80
+      - service: http_status:404
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -30,21 +56,31 @@ spec:
           labelSelector:
             matchLabels:
               app: cloudflared
+      volumes:
+        - name: config
+          configMap:
+            name: cloudflared-config
+        - name: creds
+          secret:
+            secretName: cloudflared-creds
       containers:
         - name: cloudflared
           image: cloudflare/cloudflared:2026.10.5
           args:
             - tunnel
+            - --config
+            - /etc/cloudflared/config/config.yaml
             - --no-autoupdate
             - --metrics
             - 0.0.0.0:2000
             - run
-          env:
-            - name: TUNNEL_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: cloudflared-token
-                  key: token
+          volumeMounts:
+            - name: config
+              mountPath: /etc/cloudflared/config
+              readOnly: true
+            - name: creds
+              mountPath: /etc/cloudflared/creds
+              readOnly: true
           ports:
             - containerPort: 2000
               name: metrics
