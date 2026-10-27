@@ -1,3 +1,5 @@
+> **Historical:** this describes the retired GCE load balancer / origin certificate setup. The site is now served through a Cloudflare Tunnel; see `CLOUDFLARE_TUNNEL.md`.
+
 # URGENT: Deploy Origin Certificate to Fix SSL Error
 
 > **Historical (completed).** The Ingress cutover is done, and on 2026-10-23 the old

@@ -77,8 +77,6 @@ metadata:
   name: falcon-api
   labels:
     app: falcon-api
-  annotations:
-    cloud.google.com/backend-config: '{"default": "falcon-cloudflare-only"}'
 spec:
   selector:
     app: falcon-api

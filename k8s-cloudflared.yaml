@@ -23,11 +23,6 @@ data:
         service: http://falcon-api.default.svc.cluster.local:5003
       - hostname: www.falconmanagerpro.com
         service: http://falcon-ui.default.svc.cluster.local:80
-      - hostname: tunnel-test.falconmanagerpro.com
-        path: ^/api/
-        service: http://falcon-api.default.svc.cluster.local:5003
-      - hostname: tunnel-test.falconmanagerpro.com
-        service: http://falcon-ui.default.svc.cluster.local:80
       - service: http_status:404
 ---
 apiVersion: apps/v1

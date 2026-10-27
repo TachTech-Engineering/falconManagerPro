@@ -92,9 +92,9 @@ User
   ↓
 Cloudflare CDN (TLS Termination)
   ↓ [Full Strict TLS]
-GCP Load Balancer (136.110.230.236)
+Cloudflare Tunnel (cloudflared pods)
   ↓
-Kubernetes Ingress
+cloudflared routing (ConfigMap rules)
   ├─→ /api/* → falcon-api (Flask Backend - Port 5003)
   └─→ /*     → falcon-ui (React Frontend - Port 80)
                 ↓
@@ -502,7 +502,7 @@ REACT_APP_VT_ENABLED=true           # Enable VT integration UI
 
 ### 🔧 Setup & Configuration
 - **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Complete CLI tools setup
-- **[CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)** - Infrastructure & TLS setup
+- **[CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md)** - Infrastructure & TLS setup
 - **[.env.example](.env.example)** - API credentials template
 
 ### 📖 Usage Guides
@@ -557,7 +557,7 @@ Reference: [SCRIPTS_REFERENCE.md](SCRIPTS_REFERENCE.md) → Workflow patterns
 3. Switch: `export ENV_FILE=customer.env`
 
 ### 🏗️ Deploy Infrastructure
-1. Read: [CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)
+1. Read: [CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md)
 2. Deploy: K8s configurations to GKE
 3. Configure: DNS and SSL/TLS in Cloudflare
 
@@ -954,7 +954,7 @@ echo $SMTP_FROM
 **TLS Certificates:**
 - **Cloudflare Origin Certificate**: Expires November 20, 2040
 - **Reminder set**: November 2039 (1 year advance warning)
-- **Renewal process**: See [CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)
+- **Renewal process**: See [CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md)
 - **Auto-renewal**: Not available for origin certificates (manual process)
 
 **Steps to Renew:**
@@ -1096,7 +1096,7 @@ VACUUM ANALYZE;
 - **Cluster Nodes**: 2 (GKE Autopilot, auto-scales to 10)
 - **Services**: 2 (falcon-api, falcon-ui)
 - **Ingress**: 1 with TLS termination
-- **Static IPs**: 1 reserved (136.110.230.236)
+- **Static IPs**: none (served via Cloudflare Tunnel)
 - **Domains**: 1 (falconmanagerpro.com)
 
 **Typical Resource Usage:**
@@ -1248,7 +1248,7 @@ A: Not built-in. Add custom playbook action to create tickets via API. Example: 
 ### 📚 Documentation
 - **README.md** (this file) - Project overview and quick start
 - **[SETUP_GUIDE.md](SETUP_GUIDE.md)** - Complete CLI tools setup
-- **[CLOUDFLARE_TLS_SETUP.md](CLOUDFLARE_TLS_SETUP.md)** - Infrastructure & TLS setup
+- **[CLOUDFLARE_TUNNEL.md](CLOUDFLARE_TUNNEL.md)** - Infrastructure & TLS setup
 - **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - CLI command reference
 - **[SCRIPTS_REFERENCE.md](SCRIPTS_REFERENCE.md)** - Detailed script documentation
 - **[falcon_pro_README.md](falcon_pro_README.md)** - Web app features & usage
